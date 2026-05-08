@@ -451,7 +451,7 @@ def layout() -> html.Div:
             dbc.Col(
                 html.Span(
                     id="explorer-row-count",
-                    children=f"{len(df):,} buildings shown",
+                    children="Loading...",
                     style={
                         "backgroundColor": BOL_PALETTE["teal"],
                         "color": "#FFFFFF",
