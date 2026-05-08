@@ -1,0 +1,10 @@
+dash>=2.17
+dash-bootstrap-components>=1.6
+dash-ag-grid>=31.0
+pandas>=2.0
+pyarrow>=14.0
+geopandas>=0.14
+shapely>=2.0
+plotly>=5.18
+polars>=0.20
+duckdb>=0.9

@@ -1,0 +1,44 @@
+/* EPC Explorer — custom theme overrides */
+
+@import url('https://fonts.googleapis.com/css2?family=Lora:wght@400;700&family=Open+Sans:wght@400;600&display=swap');
+
+body {
+    font-family: 'Open Sans', sans-serif;
+    margin: 0;
+    background-color: #F0F0F5;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Lora', serif;
+}
+
+/* Sidebar nav links */
+.nav-pills .nav-link {
+    color: #FFFFFF !important;
+    transition: background-color 0.2s;
+}
+.nav-pills .nav-link:hover {
+    background-color: rgba(255, 255, 255, 0.15) !important;
+}
+.nav-pills .nav-link.active {
+    background-color: #CBAC88 !important;
+    color: #282850 !important;
+}
+
+/* AG Grid scrollbar styling */
+.ag-theme-alpine .ag-body-viewport::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+.ag-theme-alpine .ag-body-viewport::-webkit-scrollbar-thumb {
+    background: #7F7F85;
+    border-radius: 4px;
+}
+.ag-theme-alpine .ag-body-viewport::-webkit-scrollbar-track {
+    background: #F0F0F5;
+}
+
+/* Center header text for non-text columns */
+.ag-header-cell-center .ag-header-cell-label {
+    justify-content: center;
+}
