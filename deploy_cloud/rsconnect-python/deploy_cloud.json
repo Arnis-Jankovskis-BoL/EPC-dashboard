@@ -1,0 +1,12 @@
+{
+    "https://test-posit-c.bank.lv/": {
+        "server_url": "https://test-posit-c.bank.lv/",
+        "filename": "C:\\__VSCode_Copilot\\EPC_proxy\\deploy_cloud",
+        "app_url": "https://test-posit-c.bank.lv/content/ba067013-3aa7-4acb-a76e-30c79fc33da5/",
+        "app_id": "156",
+        "app_guid": "ba067013-3aa7-4acb-a76e-30c79fc33da5",
+        "title": "EPC_dashboard",
+        "app_mode": "python-dash",
+        "app_store_version": 1
+    }
+}

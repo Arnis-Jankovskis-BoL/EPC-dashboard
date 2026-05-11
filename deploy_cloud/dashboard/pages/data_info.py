@@ -40,7 +40,7 @@ COLUMNS = [
      "Top SHAP feature (mean |SHAP| = 0.25).",
      "Attīrītais pasta indekss (LV-XXXX). Kalpo kā telpiskais aizstājējs, kas uztver "
      "vietējā ēku fonda, klimata zonas un sociālekonomiskos raksturlielumus.",
-     "numeric"),
+     "categorical"),
 
     ("ReferencesPlatiba", "Reference Floor Area (m²)", "Atsauces platība (m²)",
      "EPC certificate",

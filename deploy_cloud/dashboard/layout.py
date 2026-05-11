@@ -114,32 +114,30 @@ def build_layout() -> html.Div:
         }),
     ], id="lang-toggle-container", style={"position": "fixed", "top": "10px", "right": "20px", "zIndex": "9999"})
 
+    from dashboard.pages.building_explorer import layout as explorer_layout
+    from dashboard.pages.model_info import layout as model_info_layout
+    from dashboard.pages.data_info import layout as data_info_layout
+
     return html.Div([
         dcc.Location(id="url", refresh=False),
         lang_toggle,
         _sidebar(),
-        html.Div(id="page-content", style=CONTENT_STYLE),
+        html.Div([
+            html.Div(explorer_layout(), id="page-explorer"),
+            html.Div(data_info_layout(), id="page-data-info", style={"display": "none"}),
+            html.Div(model_info_layout(), id="page-model-info", style={"display": "none"}),
+        ], id="page-content", style=CONTENT_STYLE),
     ])
 
 
 def register_routing(app: Dash) -> None:
     """Register the URL → page callback and language toggle."""
     from dash import callback, ctx, no_update
-    from dashboard.pages.building_explorer import layout as explorer_layout
-    from dashboard.pages.model_info import layout as model_info_layout
     from dashboard.pages.model_info import register_callbacks as register_model_info_callbacks
-    from dashboard.pages.data_info import layout as data_info_layout
     from dashboard.pages.data_info import register_callbacks as register_data_info_callbacks
 
     register_model_info_callbacks(app)
     register_data_info_callbacks(app)
-
-    # Populate page-content with all pages at startup (not re-rendered on URL change)
-    app.layout.children[-1].children = [
-        html.Div(explorer_layout(), id="page-explorer"),
-        html.Div(data_info_layout(), id="page-data-info", style={"display": "none"}),
-        html.Div(model_info_layout(), id="page-model-info", style={"display": "none"}),
-    ]
 
     @app.callback(
         Output("page-explorer", "style"),

@@ -125,7 +125,7 @@ def _tab_overview(lang: str) -> html.Div:
                     html.Li("22 887 ēkas ar zināmiem EPC sertifikātiem no 7 datu avotiem."),
                     html.Li("Labākais individuālais modelis: CatBoost klasifikators — 54.6% precīza atbilstība, 81.0% ±1 klases precizitāte."),
                     html.Li("Labākā specifikācija: Ensemble-stack-cls (LightGBM + XGBoost + CatBoost ar LogReg meta-mācīšanos) — 53.7% precīza, 81.6% ±1."),
-                    html.Li("Salīdzinot ar 2025. g. bāzlīniju (6 pazīmes): +3 pp precīzā atbilstībā, +2 pp ±1 precizitātē."),
+                    html.Li("Salīdzinot ar 2025. g. bāzlīniju (6 pazīmes): +10 pp precīzā atbilstībā, +3 pp ±1 precizitātē."),
                     html.Li("Prognozētas ~381 000 dzīvojamo ēku energoefektivitātes klases visā Latvijā."),
                     html.Li("Konformālie prognozēšanas intervāli (CQR) ar mainīgu platumu katrai ēkai."),
                     html.Li("ES taksonomijas 15% energoefektivitātes slieksnis: ~139 kWh/m²/gadā primārā enerģija."),
@@ -167,7 +167,7 @@ def _tab_overview(lang: str) -> html.Div:
                     html.Li("22,887 buildings with known EPCs, enriched from 7 data sources."),
                     html.Li("Best individual model: CatBoost classifier — 54.6% exact match, 81.0% ±1 class accuracy."),
                     html.Li("Best specification: Ensemble-stack-cls (LightGBM + XGBoost + CatBoost with LogReg meta-learner) — 53.7% exact, 81.6% ±1."),
-                    html.Li("Compared to 2025 baseline (6 features): +3 pp exact, +2 pp ±1 accuracy."),
+                    html.Li("Compared to 2025 baseline (6 features): +10 pp exact, +3 pp ±1 accuracy."),
                     html.Li("Predicted EPC classes for ~381,000 residential buildings across Latvia."),
                     html.Li("Conformal prediction intervals (CQR) with variable-width bounds for each building."),
                     html.Li("EU Taxonomy 15% energy-efficiency threshold: ~139 kWh/m²/year primary energy."),
@@ -213,7 +213,7 @@ def _tab_literature(lang: str) -> html.Div:
         ["Sheng et al. (2022)", "UK", "5,933", "EPC+StreetView", "CNN+MLP", "MAD 0.01 kWh/m²/yr"],
         ["Seyedzadeh et al. (2018)", "Review", "67 studies", "—", "Review", "GBM/RF most effective"],
         ["Jankovskis & Strazdiņš (2025)", "Latvia", "19,715", "6", "LightGBM", "40%/49% exact (houses/apts)"],
-        ["This study", "Latvia", "22,887", "71", "CatBoost", "47.6% exact, 79.8% ±1 (CV)"],
+        ["This study", "Latvia", "22,887", "71", "CatBoost", "54.6% exact, 81.0% ±1"],
     ]
 
     if lang == "lv":
@@ -256,11 +256,12 @@ def _tab_literature(lang: str) -> html.Div:
                         ["2025 replikācija (kombinēts)", "6", "Nejauša 80/20", "44.7", "78.4"],
                         ["Mūsu cauruļvads (6 pazīmes)", "6", "Nejauša 5-fold", "46.0", "77.7"],
                         ["Mūsu cauruļvads (6 pazīmes)", "6", "Teritoriāla", "41.7", "73.3"],
+                        ["Pilns cauruļvads (71 pazīme)", "71", "Nejauša 80/20", "54.6", "81.0"],
                         ["Pilns cauruļvads (71 pazīme)", "71", "Nejauša 5-fold", "47.6", "81.2"],
                         ["Pilns cauruļvads (71 pazīme)", "71", "Teritoriāla", "46.8", "80.2"],
                     ],
                 ),
-                _p("Pilns cauruļvads uzlabo precīzo atbilstību par ~3 pp un ±1 precizitāti par ~2 pp "
+                _p("Pilns cauruļvads (nejauša 80/20) uzlabo precīzo atbilstību par ~10 pp un ±1 precizitāti par ~3 pp "
                    "salīdzinot ar 2025. g. bāzlīniju."),
             ]),
         ])
@@ -304,11 +305,12 @@ def _tab_literature(lang: str) -> html.Div:
                         ["2025 replication (combined)", "6", "Random 80/20", "44.7", "78.4"],
                         ["Our pipeline (6 features)", "6", "Random 5-fold", "46.0", "77.7"],
                         ["Our pipeline (6 features)", "6", "Territory", "41.7", "73.3"],
+                        ["Full pipeline (71 features)", "71", "Random 80/20", "54.6", "81.0"],
                         ["Full pipeline (71 features)", "71", "Random 5-fold", "47.6", "81.2"],
                         ["Full pipeline (71 features)", "71", "Territory", "46.8", "80.2"],
                     ],
                 ),
-                _p("The full pipeline improves exact accuracy by ~3 pp and ±1 accuracy by ~2 pp compared "
+                _p("The full pipeline (random 80/20) improves exact accuracy by ~10 pp and ±1 accuracy by ~3 pp compared "
                    "to the 2025 baseline."),
             ]),
         ])
