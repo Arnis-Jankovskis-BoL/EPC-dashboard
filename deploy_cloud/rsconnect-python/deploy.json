@@ -1,0 +1,22 @@
+{
+    "https://test-posit-c.bank.lv/": {
+        "server_url": "https://test-posit-c.bank.lv/",
+        "filename": "C:\\__VSCode_Copilot\\EPC_proxy\\deploy",
+        "app_url": "https://test-posit-c.bank.lv/content/2b01b3c3-8d09-4135-8f32-9d1b7dd47e4a/",
+        "app_id": "154",
+        "app_guid": "2b01b3c3-8d09-4135-8f32-9d1b7dd47e4a",
+        "title": "EPC_dashboard",
+        "app_mode": "python-dash",
+        "app_store_version": 1
+    },
+    "https://prod-posit-c.bank.lv/": {
+        "server_url": "https://prod-posit-c.bank.lv/",
+        "filename": "C:\\__VSCode_Copilot\\EPC_proxy\\deploy",
+        "app_url": "https://prod-posit-c.bank.lv/content/68328d2c-61e6-4f9c-9039-ebb81f5b9b82/",
+        "app_id": "446",
+        "app_guid": "68328d2c-61e6-4f9c-9039-ebb81f5b9b82",
+        "title": "EPC_dashboard",
+        "app_mode": "python-dash",
+        "app_store_version": 1
+    }
+}
