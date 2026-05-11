@@ -1,6 +1,8 @@
 dash>=2.17
 dash-bootstrap-components>=1.6
 dash-ag-grid>=31.0
+dash-deck>=0.0.1
+pydeck>=0.9
 pandas>=2.0
 pyarrow>=14.0
 geopandas>=0.14

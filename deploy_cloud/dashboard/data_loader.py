@@ -34,6 +34,8 @@ EPC_TABLE_COLUMNS: list[str] = [
     # Energy Performance
     "EnergoefektivKlase",
     "EnergijaApkurei",
+    "epc_class_cert",
+    "epc_class_georiga",
     "EnergoefektivKlase_georiga_pref",
     "EnergijaApkurei_georiga_pref",
     "PrimaraNeatjaunojamaEnergija",
@@ -44,6 +46,9 @@ EPC_TABLE_COLUMNS: list[str] = [
     # Predicted (model proxy — available for full residential dataset)
     "predicted_epc_class",
     "predicted_heating_kwh",
+    "cqr_lower",
+    "cqr_upper",
+    "interval_width",
     # Combined (certificate if available, otherwise predicted)
     "combined_epc_class",
     "combined_heating_kwh",
@@ -77,6 +82,13 @@ EPC_TABLE_COLUMNS: list[str] = [
     "renovation_detected",
     "years_since_renovation",
     "partial_renovation_flag",
+    # Coordinates (WGS84)
+    "lat_4326",
+    "lon_4326",
+    # Technical
+    "KOORD_X",
+    "KOORD_Y",
+    "_provenance",
 ]
 
 # Default columns shown on first load (subset for readability)
@@ -147,9 +159,9 @@ def load_epc_data() -> pd.DataFrame:
                              errors="coerce")
     _real_primary = pd.to_numeric(df.get("PrimaraNeatjaunojamaEnergija"), errors="coerce")
     df["estimated_primary_energy"] = _real_primary.fillna(1.41 * _heating + 34.18).round(1)
-    # EU Taxonomy top 15%: primary energy <= 141.8 kWh/m²/yr (P16-S5 threshold, all types)
+    # EU Taxonomy top 15%: primary energy <= 139.1 kWh/m²/yr (updated P16-S5 threshold after re-scoring)
     _pe = df["estimated_primary_energy"]
-    df["eu_taxonomy_top15"] = _pe <= 141.8
+    df["eu_taxonomy_top15"] = _pe <= 139.1
     # Percentile rank (lower energy = lower percentile = better)
     df["primary_energy_pctile"] = _pe.rank(pct=True, method="average").mul(100).round(1)
     # By building type (Individual houses vs Apartments)

@@ -41,6 +41,14 @@ COLUMN_META: dict[str, tuple[str, str]] = {
         "EPC Class (GeoRiga Preferred)",
         "EPC class preferring GeoRiga value when both sources overlap; falls back to certificate value.",
     ),
+    "epc_class_cert": (
+        "EPC Class (Cert. Only)",
+        "EPC class from certificate only — blank for buildings with GeoRiga-only data.",
+    ),
+    "epc_class_georiga": (
+        "EPC Class (GeoRiga Only)",
+        "EPC class from GeoRiga registry only — blank for buildings with certificate-only data.",
+    ),
     "EnergijaApkurei": (
         "Heating Energy (kWh/m²/yr)",
         "Specific energy consumption for heating per square metre per year, from the EPC certificate.",
@@ -59,7 +67,7 @@ COLUMN_META: dict[str, tuple[str, str]] = {
     ),
     "eu_taxonomy_top15": (
         "EU Taxonomy Top 15%",
-        "True if building's primary energy \u2264141.8 kWh/m\xb2/yr (top 15% lowest consumption threshold).",
+        "True if building's primary energy \u2264139.1 kWh/m\u00b2/yr (top 15% lowest consumption threshold).",
     ),
     "primary_energy_pctile": (
         "Energy Percentile (All)",
@@ -292,6 +300,10 @@ COLUMN_META_LV: dict[str, tuple[str, str]] = {
     "apkaime_name": ("Apkaime", "Apkaimes nosaukums Rīgai un Daugavpilij."),
     "combined_epc_class": ("Apvienotā EPC klase", "EPC klase no sertifikāta vai GeoRiga (apvienota)."),
     "combined_heating_kwh": ("Apvienotā apkure (kWh/m²/g.)", "Apkures enerģija no sertifikāta vai GeoRiga (apvienota)."),
+    "epc_class_cert": ("EPC klase (tikai sert.)", "EPC klase tikai no sertifikāta — tukša, ja dati tikai no GeoRiga."),
+    "epc_class_georiga": ("EPC klase (tikai GeoRiga)", "EPC klase tikai no GeoRiga reģistra."),
+    "lat_4326": ("Platums (WGS84)", "WGS84 ģeogrāfiskais platums."),
+    "lon_4326": ("Garums (WGS84)", "WGS84 ģeogrāfiskais garums."),
 }
 
 

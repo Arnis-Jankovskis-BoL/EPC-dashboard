@@ -10,6 +10,7 @@ from dash import ALL, Input, Output, State, callback, clientside_callback, ctx, 
 import dash_ag_grid as dag
 import dash_bootstrap_components as dbc
 
+
 from dashboard.data_loader import (
     DEFAULT_VISIBLE,
     EPC_TABLE_COLUMNS,
@@ -17,7 +18,13 @@ from dashboard.data_loader import (
 from dashboard.column_meta import get_display_name, get_filter_type, get_tooltip
 from dashboard.theme import BOL_PALETTE, CARD_STYLE, EPC_PALETTE, EPC_CLASSES
 from dashboard.i18n import t
-from dashboard.i18n import t
+
+# Provenance bitmask → column mapping for teal font on estimated values.
+# Currently empty — all 381k dashboard values come from official sources.
+# Will be populated when KNN/parsed estimates are added to the pipeline.
+COLUMN_PROVENANCE_BITS: dict[str, int] = {
+    "construction_year": 128,  # PROV_YEAR_ESTIMATED — estimated from acceptance year
+}
 
 _PLOT_STYLE_VISIBLE = {"flex": "0 1 340px", "minWidth": "260px", "maxWidth": "380px"}
 _PLOT_STYLE_HIDDEN = {"display": "none"}
@@ -45,6 +52,33 @@ WALL_COLORS: dict[str, str] = {
     "Other": "#95A5A6",                 # light grey
     "N/A": "#999",
 }
+
+# Floor count groups (BuildingGroundFloors → display group)
+FLOOR_GROUPS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10+"]
+
+# Building type groups
+BUILDING_TYPES = ["Residential_Individual", "Residential_Apartment"]
+BUILDING_TYPE_DISPLAY: dict[str, dict[str, str]] = {
+    "Residential_Individual": {"lv": "Individuālā", "en": "Individual"},
+    "Residential_Apartment": {"lv": "Daudzdzīvokļu", "en": "Apartment"},
+}
+BUILDING_TYPE_COLORS: dict[str, str] = {
+    "Residential_Individual": BOL_PALETTE["accent1"],
+    "Residential_Apartment": BOL_PALETTE["accent1"],
+    "N/A": "#999",
+}
+
+
+def _floor_group(val: int | None) -> str:
+    """Map a raw BuildingGroundFloors integer to a display group."""
+    if val is None or pd.isna(val):
+        return "N/A"
+    val = int(val)
+    if val <= 0:
+        return "N/A"
+    if val <= 9:
+        return str(val)
+    return "10+"
 
 # Column picker blocks — ordered list of (block_label, [col_names])
 # Only columns that actually exist in the data will be shown.
@@ -88,18 +122,21 @@ COLUMN_BLOCKS: list[tuple[str, list[str]]] = [
 _FULL_ONLY_COLS = {"predicted_epc_class", "predicted_heating_kwh"}
 
 
-def _build_column_picker(available_cols: set[str], picker_type: str = "display", lang: str = "en") -> html.Div:
+def _build_column_picker(available_cols: set[str], picker_type: str = "display", lang: str = "en", selected: set[str] | None = None) -> html.Div:
     """Build a grouped column picker with labelled blocks.
     
     picker_type: "load" for data loading panel, "display" for table visibility panel.
+    selected: if provided, use these as checked values instead of DEFAULT_VISIBLE.
     """
+    use_selected = selected if selected is not None else set(DEFAULT_VISIBLE)
     blocks = []
     for label, cols in COLUMN_BLOCKS:
         valid_cols = [c for c in cols if c in available_cols]
         if not valid_cols:
             continue
+        display_label = BLOCK_LABELS.get(label, {}).get(lang, label)
         blocks.append(html.Div([
-            html.Div(label, style={
+            html.Div(display_label, style={
                 "fontWeight": "600", "fontSize": "0.78rem",
                 "color": BOL_PALETTE["navy"], "marginBottom": "2px",
                 "borderBottom": f"1px solid {BOL_PALETTE['grey']}",
@@ -120,7 +157,7 @@ def _build_column_picker(available_cols: set[str], picker_type: str = "display",
                     }
                     for c in valid_cols
                 ],
-                value=[c for c in valid_cols if c in DEFAULT_VISIBLE],
+                value=[c for c in valid_cols if c in use_selected],
                 inline=True,
                 style={"fontSize": "0.82rem"},
             ),
@@ -260,10 +297,29 @@ def _make_column_defs(
         }
         # Center non-text columns
         if col not in _LEFT_ALIGN:
-            cd["cellStyle"] = {"textAlign": "center"}
+            base_style = {"textAlign": "center"}
+        else:
+            base_style = {}
+        # Add provenance-based teal font for estimated/derived values
+        prov_bits = COLUMN_PROVENANCE_BITS.get(col)
+        if prov_bits:
+            cd["cellStyle"] = {
+                "styleConditions": [
+                    {
+                        "condition": f"params.data && (params.data._provenance & {prov_bits}) > 0",
+                        "style": {**base_style, "color": "#489E9E"},
+                    },
+                ],
+                "defaultStyle": base_style,
+            }
+        else:
+            cd["cellStyle"] = base_style
+        if col not in _LEFT_ALIGN:
             cd["headerClass"] = "ag-header-cell-center"
         # EPC class → small colored badge via JS renderer
-        if col in ("EnergoefektivKlase", "EnergoefektivKlase_georiga_pref", "combined_epc_class", "predicted_epc_class"):
+        if col in ("EnergoefektivKlase", "EnergoefektivKlase_georiga_pref",
+                   "epc_class_cert", "epc_class_georiga",
+                   "combined_epc_class", "predicted_epc_class"):
             cd["cellRenderer"] = "EpcBadge"
             cd["cellStyle"] = {"textAlign": "center"}
         # Boolean columns → checkbox renderer
@@ -276,6 +332,26 @@ _BOOL_COLS = {"address_mismatch", "estimated_from_address", "district_heating_fl
               "is_renovated_before_epc", "renovation_detected", "partial_renovation_flag",
               "eu_taxonomy_top15"}
 
+# Wall material display translations (data values are always English)
+WALL_MATERIAL_DISPLAY: dict[str, dict[str, str]] = {
+    "Wood": {"en": "Wood", "lv": "Koks"},
+    "Brick and stone": {"en": "Brick and stone", "lv": "Ķieģeļi un akmens"},
+    "Concrete": {"en": "Concrete", "lv": "Betons"},
+    "Lightweight concrete": {"en": "Lightweight concrete", "lv": "Vieglais betons"},
+    "Metal and glass": {"en": "Metal and glass", "lv": "Metāls un stikls"},
+    "Other": {"en": "Other", "lv": "Cits"},
+    "N/A": {"en": "N/A", "lv": "N/A"},
+}
+
+# Block label translations for column picker
+BLOCK_LABELS: dict[str, dict[str, str]] = {
+    "Identification": {"en": "Identification", "lv": "Identifikācija"},
+    "Location": {"en": "Location", "lv": "Atrašanās vieta"},
+    "Energy": {"en": "Energy", "lv": "Enerģija"},
+    "Physical": {"en": "Physical", "lv": "Fiziskās īpašības"},
+    "Heating & Renovation": {"en": "Heating & Renovation", "lv": "Apkure un atjaunošana"},
+}
+
 
 # ---------------------------------------------------------------------------
 # Slicer builders
@@ -283,7 +359,7 @@ _BOOL_COLS = {"address_mismatch", "estimated_from_address", "district_heating_fl
 
 def _build_epc_slicer() -> html.Div:
     return html.Div([
-        html.Span("EPC Class: ", style={"fontSize": "0.85rem", "color": BOL_PALETTE["grey"], "marginRight": "6px"}),
+        html.Span("EPC klase: ", id="epc-slicer-label", style={"fontSize": "0.85rem", "color": BOL_PALETTE["grey"], "marginRight": "6px"}),
         *[html.Button(cls, id={"type": "epc-slicer", "index": cls}, n_clicks=0, style={
             "backgroundColor": EPC_PALETTE[cls], "color": "#FFF" if cls in ("F", "E", "A") else BOL_PALETTE["navy"],
             "border": "2px solid transparent", "borderRadius": "16px", "padding": "4px 14px",
@@ -294,7 +370,7 @@ def _build_epc_slicer() -> html.Div:
             "borderRadius": "16px", "padding": "4px 12px", "marginRight": "4px", "fontWeight": "500",
             "fontSize": "0.85rem", "cursor": "pointer",
         }),
-        html.Button("All", id="epc-slicer-all", n_clicks=0, style={
+        html.Button("Visi", id="epc-slicer-all", n_clicks=0, style={
             "backgroundColor": BOL_PALETTE["navy"], "color": "#FFF", "border": "2px solid transparent",
             "borderRadius": "16px", "padding": "4px 14px", "marginLeft": "8px", "fontWeight": "600",
             "fontSize": "0.85rem", "cursor": "pointer",
@@ -304,7 +380,7 @@ def _build_epc_slicer() -> html.Div:
 
 def _build_era_slicer() -> html.Div:
     return html.Div([
-        html.Span("Era: ", style={"fontSize": "0.85rem", "color": BOL_PALETTE["grey"], "marginRight": "6px"}),
+        html.Span("Periods: ", id="era-slicer-label", style={"fontSize": "0.85rem", "color": BOL_PALETTE["grey"], "marginRight": "6px"}),
         *[html.Button(era, id={"type": "era-slicer", "index": era}, n_clicks=0, style={
             "backgroundColor": BOL_PALETTE["accent1"], "color": "#FFF", "border": "2px solid transparent",
             "borderRadius": "16px", "padding": "4px 12px", "marginRight": "4px", "fontWeight": "500",
@@ -315,7 +391,28 @@ def _build_era_slicer() -> html.Div:
             "borderRadius": "16px", "padding": "4px 12px", "marginRight": "4px", "fontWeight": "500",
             "fontSize": "0.8rem", "cursor": "pointer",
         }),
-        html.Button("All", id="era-slicer-all", n_clicks=0, style={
+        html.Button("Visi", id="era-slicer-all", n_clicks=0, style={
+            "backgroundColor": BOL_PALETTE["navy"], "color": "#FFF", "border": "2px solid transparent",
+            "borderRadius": "16px", "padding": "4px 14px", "marginLeft": "8px", "fontWeight": "600",
+            "fontSize": "0.8rem", "cursor": "pointer",
+        }),
+    ], style={"marginBottom": "0.5rem", "display": "flex", "alignItems": "center", "flexWrap": "wrap"})
+
+
+def _build_floor_slicer() -> html.Div:
+    return html.Div([
+        html.Span("Stāvi: ", id="floor-slicer-label", style={"fontSize": "0.85rem", "color": BOL_PALETTE["grey"], "marginRight": "6px"}),
+        *[html.Button(fg, id={"type": "floor-slicer", "index": fg}, n_clicks=0, style={
+            "backgroundColor": BOL_PALETTE["accent1"], "color": "#FFF", "border": "2px solid transparent",
+            "borderRadius": "16px", "padding": "4px 12px", "marginRight": "4px", "fontWeight": "500",
+            "fontSize": "0.8rem", "cursor": "pointer",
+        }) for fg in FLOOR_GROUPS],
+        html.Button("N/A", id={"type": "floor-slicer", "index": "N/A"}, n_clicks=0, style={
+            "backgroundColor": "#BDBDBD", "color": "#FFF", "border": "2px solid transparent",
+            "borderRadius": "16px", "padding": "4px 12px", "marginRight": "4px", "fontWeight": "500",
+            "fontSize": "0.8rem", "cursor": "pointer",
+        }),
+        html.Button("Visi", id="floor-slicer-all", n_clicks=0, style={
             "backgroundColor": BOL_PALETTE["navy"], "color": "#FFF", "border": "2px solid transparent",
             "borderRadius": "16px", "padding": "4px 14px", "marginLeft": "8px", "fontWeight": "600",
             "fontSize": "0.8rem", "cursor": "pointer",
@@ -325,8 +422,8 @@ def _build_era_slicer() -> html.Div:
 
 def _build_wall_slicer() -> html.Div:
     return html.Div([
-        html.Span("Wall: ", style={"fontSize": "0.85rem", "color": BOL_PALETTE["grey"], "marginRight": "6px"}),
-        *[html.Button(mat, id={"type": "wall-slicer", "index": mat}, n_clicks=0, style={
+        html.Span("Sienas: ", id="wall-slicer-label", style={"fontSize": "0.85rem", "color": BOL_PALETTE["grey"], "marginRight": "6px"}),
+        *[html.Button(WALL_MATERIAL_DISPLAY[mat]["lv"], id={"type": "wall-slicer", "index": mat}, n_clicks=0, style={
             "backgroundColor": WALL_COLORS[mat], "color": "#FFF", "border": "2px solid transparent",
             "borderRadius": "16px", "padding": "4px 12px", "marginRight": "4px", "fontWeight": "500",
             "fontSize": "0.8rem", "cursor": "pointer",
@@ -336,13 +433,30 @@ def _build_wall_slicer() -> html.Div:
             "borderRadius": "16px", "padding": "4px 12px", "marginRight": "4px", "fontWeight": "500",
             "fontSize": "0.8rem", "cursor": "pointer",
         }),
-        html.Button("All", id="wall-slicer-all", n_clicks=0, style={
+        html.Button("Visi", id="wall-slicer-all", n_clicks=0, style={
             "backgroundColor": BOL_PALETTE["navy"], "color": "#FFF", "border": "2px solid transparent",
             "borderRadius": "16px", "padding": "4px 14px", "marginLeft": "8px", "fontWeight": "600",
             "fontSize": "0.8rem", "cursor": "pointer",
         }),
     ], style={"marginBottom": "0.5rem", "display": "flex", "alignItems": "center", "flexWrap": "wrap"})
 
+
+
+
+def _build_type_slicer() -> html.Div:
+    return html.Div([
+        html.Span("Ēkas tips: ", id="type-slicer-label", style={"fontSize": "0.85rem", "color": BOL_PALETTE["grey"], "marginRight": "6px"}),
+        *[html.Button(BUILDING_TYPE_DISPLAY[bt]["lv"], id={"type": "type-slicer", "index": bt}, n_clicks=0, style={
+            "backgroundColor": BOL_PALETTE["accent1"], "color": "#FFF", "border": "2px solid transparent",
+            "borderRadius": "16px", "padding": "4px 12px", "marginRight": "4px", "fontWeight": "500",
+            "fontSize": "0.8rem", "cursor": "pointer",
+        }) for bt in BUILDING_TYPES],
+        html.Button("Visi", id="type-slicer-all", n_clicks=0, style={
+            "backgroundColor": BOL_PALETTE["navy"], "color": "#FFF", "border": "2px solid transparent",
+            "borderRadius": "16px", "padding": "4px 14px", "marginLeft": "8px", "fontWeight": "600",
+            "fontSize": "0.8rem", "cursor": "pointer",
+        }),
+    ], style={"marginBottom": "0.5rem", "display": "flex", "alignItems": "center", "flexWrap": "wrap"})
 
 # ---------------------------------------------------------------------------
 # Layout
@@ -416,26 +530,28 @@ def layout() -> html.Div:
                         },
                     ),
                     dbc.Tooltip(
-                        "Type a search term and press Enter to add it as a filter chip. "
-                        "Add multiple terms — use the Any/All toggle below to control matching.",
+                        "Ievadiet meklēšanas vārdu un nospiediet Enter, lai pievienotu filtru. "
+                        "Pievienojiet vairākus vārdus — izmantojiet Jebkurš/Visi pārslēgu.",
+                        id="search-tooltip",
                         target="search-box-container",
                         placement="top",
                     ),
                     # AND/OR toggle
                     html.Div(
                         [
-                            html.Span("Match: ", style={"fontSize": "0.8rem", "color": BOL_PALETTE["grey"], "marginRight": "4px"}),
+                            html.Span("Atbilstība: ", id="search-match-label", style={"fontSize": "0.8rem", "color": BOL_PALETTE["grey"], "marginRight": "4px"}),
                             dbc.Switch(
                                 id="search-mode-switch",
                                 label="",
                                 value=False,
                                 style={"display": "inline-block", "margin": "0 4px"},
                             ),
-                            html.Span(id="search-mode-label", children="Any",
+                            html.Span(id="search-mode-label", children="Jebkurš",
                                       style={"fontSize": "0.8rem", "fontWeight": "600", "color": BOL_PALETTE["navy"]}),
                             dbc.Tooltip(
-                                "Any: show buildings matching at least one search term. "
-                                "All: show only buildings matching every search term.",
+                                "Jebkurš: rāda ēkas, kas atbilst vismaz vienam vārdam. "
+                                "Visi: rāda tikai ēkas, kas atbilst visiem vārdiem.",
+                                id="search-mode-tooltip",
                                 target="search-mode-switch",
                                 placement="right",
                             ),
@@ -470,7 +586,9 @@ def layout() -> html.Div:
         # Stores for slicer state
         dcc.Store(id="epc-slicer-store", data=list(EPC_CLASSES_DISPLAY) + ["N/A"]),
         dcc.Store(id="era-slicer-store", data=list(ERA_BINS) + ["N/A"]),
+        dcc.Store(id="floor-slicer-store", data=list(FLOOR_GROUPS) + ["N/A"]),
         dcc.Store(id="wall-slicer-store", data=list(WALL_MATERIALS) + ["N/A"]),
+        dcc.Store(id="type-slicer-store", data=list(BUILDING_TYPES)),
 
         # Button row: Columns | Custom Filters | Filtering Breakdown | Plots
         html.Div(id="panel-loading-msg",
@@ -492,7 +610,15 @@ def layout() -> html.Div:
                 color="secondary", size="sm", className="me-2", disabled=True,
             ), width="auto"),
             dbc.Col(dbc.Button(
-                "Grafiki \u25bc", id="plots-toggle",
+                "Grafiki ▼", id="plots-toggle",
+                color="secondary", size="sm", className="me-2", disabled=True,
+            ), width="auto"),
+            dbc.Col(dbc.Button(
+                "Kartes ▼", id="maps-toggle",
+                color="secondary", size="sm", className="me-2", disabled=True,
+            ), width="auto"),
+            dbc.Col(dbc.Button(
+                "Pielāgota izlase ▼", id="custom-sample-toggle",
                 color="secondary", size="sm", disabled=True,
             ), width="auto"),
         ], className="mb-2"),
@@ -517,35 +643,80 @@ def layout() -> html.Div:
             dbc.Row([
                 dbc.Col([
                     html.Div([
-                        html.Span("Selection mode: ", style={"fontSize": "0.8rem", "color": BOL_PALETTE["grey"]}),
+                        html.Span("Atlases režīms: ", id="slicer-mode-label-text", style={"fontSize": "0.8rem", "color": BOL_PALETTE["grey"]}),
                         dbc.Switch(
                             id="slicer-mode-switch",
                             label="",
                             value=False,
                             style={"display": "inline-block", "margin": "0 4px"},
                         ),
-                        html.Span(id="slicer-mode-label", children="Multi-select",
+                        html.Span(id="slicer-mode-label", children="Vairāku atlase",
                                   style={"fontSize": "0.8rem", "color": BOL_PALETTE["navy"], "fontWeight": "600"}),
                         dbc.Tooltip(
-                            "Multi-select: toggle individual filters on/off. "
-                            "Single-select: clicking a filter deselects all others.",
+                            "Vairāku atlase: ieslēdziet/izslēdziet atsevišķus filtrus. "
+                            "Viena atlase: noklikšķinot filtru, pārējie tiek atcelti.",
+                            id="slicer-mode-tooltip",
                             target="slicer-mode-switch",
                             placement="right",
                         ),
                     ], style={"marginBottom": "6px", "display": "flex", "alignItems": "center"}),
                     _build_epc_slicer(),
                     _build_era_slicer(),
+                    _build_floor_slicer(),
                     _build_wall_slicer(),
+                _build_type_slicer(),
                 ], width="auto", style={"padding": "8px 0"}),
                 dbc.Col([
+                    # Map mode switcher row (kebab menu above map, right-aligned)
+                    html.Div([
+                        html.Span(
+                            dbc.DropdownMenu(
+                                label="⋮",
+                                children=[
+                                    dbc.DropdownMenuItem("Karte", header=True),
+                                    dbc.DropdownMenuItem("Latvija", id="map-mode-latvia", active=True),
+                                    dbc.DropdownMenuItem("Rīga", id="map-mode-riga"),
+                                    dbc.DropdownMenuItem("Daugavpils", id="map-mode-daugavpils"),
+                                    dbc.DropdownMenuItem(divider=True),
+                                    dbc.DropdownMenuItem("Izmērs", header=True),
+                                    dbc.DropdownMenuItem("Normāls", id="map-size-normal", active=True),
+                                    dbc.DropdownMenuItem("Liels", id="map-size-large"),
+                                ],
+                                id="map-mode-menu",
+                                size="sm",
+                                toggle_style={
+                                    "backgroundColor": "transparent",
+                                    "color": BOL_PALETTE["teal"],
+                                    "border": f"1px solid {BOL_PALETTE['teal']}",
+                                    "borderRadius": "6px",
+                                    "width": "28px", "height": "28px",
+                                    "padding": "0", "fontSize": "1.1rem",
+                                    "fontWeight": "bold",
+                                    "display": "flex", "alignItems": "center",
+                                    "justifyContent": "center",
+                                    "lineHeight": "1",
+                                },
+                                toggle_class_name="no-caret",
+                                align_end=True,
+                            ),
+                            title="Mainīt kartes skatu",
+                        ),
+                    ], style={"textAlign": "right", "marginBottom": "2px"}),
                     dcc.Graph(id="map-choropleth", config={"displayModeBar": False},
                               className="mb-0",
                               style={"marginTop": "0", "marginBottom": "0", "paddingBottom": "0",
                                      "width": "480px"}),
                     dcc.Store(id="map-selected-territory", data=None),
+                    dcc.Store(id="map-mode-store", data="latvia"),
+                    dcc.Store(id="map-size-store", data="normal"),
                     html.Div([
                         dbc.Button("Nav reģiona (N/A)", id="map-na-btn", size="sm",
-                                   color="outline-info", className="mt-1 me-2",
+                                   className="mt-1 me-2",
+                                   style={"backgroundColor": "transparent",
+                                          "color": BOL_PALETTE["teal"],
+                                          "border": f"1px solid {BOL_PALETTE['teal']}",
+                                          "fontSize": "0.82rem", "borderRadius": "12px",
+                                          "padding": "0.25rem 0.6rem"},
                                    title="Rādīt ēkas bez reģiona informācijas"),
                         dbc.Button("Notīrīt kartes atlasi", id="map-clear-btn", size="sm",
                                    color="secondary", className="mt-1"),
@@ -567,6 +738,8 @@ def layout() -> html.Div:
                         {"label": "EPC klašu sadalījums", "value": "epc_dist"},
                         {"label": "Būvniecības periodu sadalījums", "value": "era_dist"},
                         {"label": "Sienu materiālu sadalījums", "value": "wall_dist"},
+                        {"label": "Stāvu sadalījums", "value": "floor_dist"},
+                        {"label": "Primārās enerģijas sadalījums", "value": "primary_energy_dist"},
                         {"label": "Vidējā apkures enerģija", "value": "avg_energy"},
                     ],
                     value=["epc_dist", "era_dist", "avg_energy"],
@@ -581,8 +754,8 @@ def layout() -> html.Div:
                         style={"fontSize": "0.8rem", "display": "inline-block"},
                     ),
                     dbc.Tooltip(
-                        "When ON, dashed outlines show the full-sample distribution "
-                        "for comparison. Turn OFF for a simple bar chart.",
+                        "Kad ieslēgts, punktētas kontūras rāda pilnas izlases sadalījumu salīdzināšanai.",
+                        id="chart-ref-tooltip",
                         target="chart-ref-toggle",
                         placement="right",
                     ),
@@ -590,13 +763,17 @@ def layout() -> html.Div:
                 dcc.Loading(
                     html.Div([
                         html.Div(id="epc-mini-chart", style={"flex": "0 1 340px", "minWidth": "260px", "maxWidth": "380px"}),
-                        dbc.Tooltip("EPC class distribution of filtered buildings. Dashed = full sample.", target="epc-mini-chart", placement="top"),
+                        dbc.Tooltip("EPC klašu sadalījums filtrētajām ēkām.", id="epc-chart-tooltip", target="epc-mini-chart", placement="top"),
                         html.Div(id="era-mini-chart", style={"flex": "0 1 340px", "minWidth": "260px", "maxWidth": "380px"}),
-                        dbc.Tooltip("Construction era distribution of filtered buildings.", target="era-mini-chart", placement="top"),
+                        dbc.Tooltip("Būvniecības periodu sadalījums filtrētajām ēkām.", id="era-chart-tooltip", target="era-mini-chart", placement="top"),
                         html.Div(id="wall-mini-chart", style={"flex": "0 1 340px", "minWidth": "260px", "maxWidth": "380px"}),
-                        dbc.Tooltip("Wall material distribution of filtered buildings.", target="wall-mini-chart", placement="top"),
+                        dbc.Tooltip("Sienu materiālu sadalījums filtrētajām ēkām.", id="wall-chart-tooltip", target="wall-mini-chart", placement="top"),
+                        html.Div(id="floor-mini-chart", style={"flex": "0 1 340px", "minWidth": "260px", "maxWidth": "380px"}),
+                        dbc.Tooltip("Virszemes stāvu sadalījums filtrētajām ēkām.", id="floor-chart-tooltip", target="floor-mini-chart", placement="top"),
+                        html.Div(id="primary-energy-chart", style={"flex": "0 1 380px", "minWidth": "280px", "maxWidth": "420px"}),
+                        dbc.Tooltip("Primārās neatjaunojamās enerģijas procentīļu sadalījums.", id="primary-energy-chart-tooltip", target="primary-energy-chart", placement="top"),
                         html.Div(id="energy-gauge-chart", style={"flex": "0 1 340px", "minWidth": "260px", "maxWidth": "380px"}),
-                        dbc.Tooltip("Average heating energy of filtered buildings vs full sample (black marker).", target="energy-gauge-chart", placement="top"),
+                        dbc.Tooltip("Vidējā apkures enerģija filtrētajām ēkām salīdzinājumā ar pilnu izlasi.", id="energy-chart-tooltip", target="energy-gauge-chart", placement="top"),
                     ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px"}),
                     type="circle",
                     color=BOL_PALETTE["teal"],
@@ -606,10 +783,120 @@ def layout() -> html.Div:
             is_open=False,
         ),
 
+        # Maps panel collapse (viewable dot map — no filtering)
+        dbc.Collapse(
+            dbc.Card([
+                html.Div([
+                    dcc.Graph(
+                        id="maps-dot-map",
+                        config={"scrollZoom": True, "displayModeBar": False},
+                        style={"height": "600px"},
+                    ),
+                    html.Div([
+                        dbc.Button("◀", id="maps-page-prev", size="sm", color="secondary",
+                                   className="me-1", disabled=True),
+                        html.Span(id="maps-page-info",
+                                  style={"fontSize": "0.8rem", "verticalAlign": "middle"}),
+                        dbc.Button("▶", id="maps-page-next", size="sm", color="secondary",
+                                   className="ms-1", disabled=True),
+                    ], style={"textAlign": "center", "marginTop": "6px"}),
+                ]),
+            ], body=True, style={"padding": "10px"}),
+            id="maps-collapse",
+            is_open=False,
+            className="mb-1",
+        ),
+        dcc.Store(id="maps-page-store", data=0),
+
+        # Custom Sample collapse
+        dbc.Collapse(
+            dbc.Card([
+                html.Div(
+                    "Ielīmējiet kadastra apzīmējumus (14 ciparu numurus), lai filtrētu datu kopu. "
+                    "Līdz 10 000 apzīmējumiem.",
+                    id="custom-sample-help",
+                    style={"fontSize": "0.75rem", "color": BOL_PALETTE["grey"], "marginBottom": "6px"},
+                ),
+                html.A(
+                    "Rādīt pieņemtos formātus",
+                    id="custom-sample-format-link",
+                    style={"fontSize": "0.75rem", "color": BOL_PALETTE["teal"], "cursor": "pointer",
+                           "textDecoration": "underline", "display": "block", "marginBottom": "4px"},
+                ),
+                dbc.Collapse(
+                    html.Pre(
+                        "• Ar komatu: 01001280293001, 01000580157004\n"
+                        "• Ar semikolu: 01001280293001; 01000580157004\n"
+                        "• Ar atstarpi: 01001280293001 01000580157004\n"
+                        "• Ar tabulāciju (ielīmēts no Excel rindas)\n"
+                        "• Pa vienai rindā (ielīmēts no Excel kolonnas)\n"
+                        "• Katram apzīmējumam jābūt tieši 14 cipariem",
+                        id="custom-sample-format-text",
+                        style={"fontSize": "0.72rem", "color": BOL_PALETTE["grey"],
+                               "backgroundColor": "#f8f8f8", "padding": "6px", "borderRadius": "4px",
+                               "marginBottom": "6px", "whiteSpace": "pre-wrap"},
+                    ),
+                    id="custom-sample-format-collapse",
+                    is_open=False,
+                ),
+                dcc.Textarea(
+                    id="custom-sample-input",
+                    placeholder="Ielīmējiet apzīmējumus šeit...\npiem. 01001280293001, 01000580157004",
+                    style={"width": "100%", "height": "120px", "fontSize": "0.82rem",
+                           "fontFamily": "monospace", "marginBottom": "8px"},
+                ),
+                html.Div([
+                    dbc.Button("Ielādēt pielāgoto izlasi", id="custom-sample-load-btn",
+                               size="sm", className="me-2",
+                               style={"backgroundColor": BOL_PALETTE["teal"], "color": "#fff",
+                                      "border": "none"}),
+                    dbc.Button("Pievienot esošajam sarakstam", id="custom-sample-add-btn",
+                               size="sm", className="me-2", disabled=True,
+                               style={"backgroundColor": "transparent",
+                                      "color": BOL_PALETTE["teal"],
+                                      "border": f"1px solid {BOL_PALETTE['teal']}"}),
+                    dbc.Button("Notīrīt pielāgoto izlasi", id="custom-sample-clear-btn",
+                               color="outline-danger", size="sm", disabled=True),
+                ], style={"marginBottom": "6px"}),
+                # Result message area
+                html.Div(id="custom-sample-result", style={"fontSize": "0.82rem", "marginTop": "4px"}),
+                # Expandable invalid entries list
+                dbc.Collapse(
+                    html.Pre(
+                        id="custom-sample-invalid-list",
+                        style={"fontSize": "0.72rem", "maxHeight": "200px", "overflowY": "auto",
+                               "backgroundColor": "#fff3cd", "padding": "6px", "borderRadius": "4px"},
+                    ),
+                    id="custom-sample-invalid-collapse",
+                    is_open=False,
+                ),
+                # Confirm modal for clearing filters
+                dbc.Modal([
+                    dbc.ModalBody(
+                        "Pielāgotas izlases ielāde notīrīs visus aktīvos filtrus. Turpināt?",
+                        id="custom-sample-confirm-body",
+                        style={"fontSize": "0.9rem"},
+                    ),
+                    dbc.ModalFooter([
+                        dbc.Button("Turpināt", id="custom-sample-confirm-yes",
+                                   style={"backgroundColor": BOL_PALETTE["teal"], "color": "#fff",
+                                          "border": "none"}, className="me-2"),
+                        dbc.Button("Atcelt", id="custom-sample-confirm-no",
+                                   color="secondary"),
+                    ]),
+                ], id="custom-sample-confirm-modal", is_open=False, centered=True),
+            ], body=True, style={"padding": "10px", "fontSize": "0.85rem"}),
+            id="custom-sample-collapse",
+            is_open=False,
+            className="mb-1",
+        ),
+        dcc.Store(id="custom-sample-store", data=[]),
+
         # Column selector collapse (single panel — display columns)
         dbc.Collapse(
             dbc.Card([
-                html.Div("Select columns to show in the table.",
+                html.Div("Izvēlieties kolonnas rādīšanai tabulā.",
+                         id="col-select-help",
                          style={"fontSize": "0.75rem", "color": BOL_PALETTE["grey"], "marginBottom": "6px"}),
                 html.Div(
                     _build_column_picker(set(all_cols), picker_type="display", lang="lv"),
@@ -661,16 +948,44 @@ def layout() -> html.Div:
             style={"minHeight": "200px"},
         ),
 
-        # Below-table row: Export CSV (left) + Pagination (right)
+        # Below-table row: Download data (left) + Pagination (right)
         html.Div([
-            dbc.Button("Eksportēt CSV", id="export-csv-btn", color="outline-secondary", size="sm"),
+            dbc.Button("Lejupielādēt datus", id="download-data-btn", color="outline-secondary", size="sm"),
+            dcc.Download(id="download-data-sink"),
             html.Div([
-                dbc.Button("← Iepriekšējie 5 000", id="page-prev-btn", color="outline-secondary",
+                # Page size selector (kebab menu)
+                html.Span(
+                    dbc.DropdownMenu(
+                        label="⋮",
+                        children=[
+                            dbc.DropdownMenuItem("1 000", id="page-size-1000", active=True),
+                            dbc.DropdownMenuItem("2 000", id="page-size-2000"),
+                            dbc.DropdownMenuItem("5 000", id="page-size-5000"),
+                            dbc.DropdownMenuItem("10 000", id="page-size-10000"),
+                        ],
+                        id="page-size-menu",
+                        size="sm",
+                        color="outline-secondary",
+                        style={"display": "inline-block", "marginRight": "8px"},
+                        toggle_style={
+                            "fontSize": "1.1rem", "padding": "0.15rem 0.4rem",
+                            "backgroundColor": "transparent",
+                            "border": f"1px solid {BOL_PALETTE['grey']}",
+                            "color": BOL_PALETTE["teal"],
+                            "borderRadius": "6px",
+                            "fontWeight": "bold",
+                            "lineHeight": "1",
+                        },
+                        toggle_class_name="no-caret",
+                    ),
+                    title="Lapas izmērs / Page size",
+                ),
+                dbc.Button("← Iepriekšējie", id="page-prev-btn", color="outline-secondary",
                            size="sm", disabled=True, style={"marginRight": "8px"}),
                 html.Span(id="page-info-label", children="1. lapa",
                           style={"fontSize": "0.82rem", "color": BOL_PALETTE["grey"],
                                  "verticalAlign": "middle", "marginRight": "8px"}),
-                dbc.Button("Nākamie 5 000 →", id="page-next-btn", color="outline-secondary",
+                dbc.Button("Nākamie →", id="page-next-btn", color="outline-secondary",
                            size="sm", disabled=True),
             ], style={"display": "flex", "alignItems": "center"}),
         ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center",
@@ -690,8 +1005,94 @@ def layout() -> html.Div:
         dcc.Store(id="initial-load-trigger", data=True),
         # DuckDB aggregation results (full dataset mode only)
         dcc.Store(id="full-agg-store", data=None),
-        # Pagination offset
+        # Pagination offset and page size
         dcc.Store(id="page-offset-store", data=0),
+        dcc.Store(id="page-size-store", data=1000),
+
+        # Download modal
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle("Lejupielādēt datus", id="download-modal-title")),
+            dbc.ModalBody([
+                # Format
+                dbc.Label("Formāts", id="download-format-label", size="sm"),
+                dbc.RadioItems(
+                    id="download-format",
+                    options=[
+                        {"label": "CSV", "value": "csv"},
+                        {"label": "Excel (XLSX)", "value": "xlsx"},
+                    ],
+                    value="csv",
+                    inline=True,
+                    className="mb-2",
+                    style={"fontSize": "0.85rem"},
+                ),
+                # CSV separator (shown only for CSV)
+                html.Div([
+                    dbc.Label("CSV atdalītājs", id="download-sep-label", size="sm"),
+                    dbc.RadioItems(
+                        id="download-separator",
+                        options=[
+                            {"label": "; (semikols)", "value": ";"},
+                            {"label": ", (komats)", "value": ","},
+                            {"label": "TAB", "value": "\t"},
+                        ],
+                        value=";",
+                        inline=True,
+                        style={"fontSize": "0.85rem"},
+                    ),
+                ], id="download-sep-container", className="mb-2"),
+                # Rows
+                dbc.Label("Rindas", id="download-rows-label", size="sm"),
+                dbc.RadioItems(
+                    id="download-rows",
+                    options=[
+                        {"label": "Pašlaik filtrētās rindas", "value": "filtered"},
+                        {"label": "Pilna datu kopa", "value": "all"},
+                    ],
+                    value="filtered",
+                    inline=True,
+                    className="mb-2",
+                    style={"fontSize": "0.85rem"},
+                ),
+                # Columns
+                dbc.Label("Kolonnas", id="download-cols-label", size="sm"),
+                dbc.RadioItems(
+                    id="download-cols-mode",
+                    options=[
+                        {"label": "Pašlaik redzamās kolonnas", "value": "visible"},
+                        {"label": "Visas pieejamās kolonnas", "value": "all"},
+                        {"label": "Pielāgota izvēle...", "value": "custom"},
+                    ],
+                    value="visible",
+                    className="mb-2",
+                    style={"fontSize": "0.85rem"},
+                ),
+                # Custom column picker (shown when "custom" selected)
+                dbc.Collapse(
+                    html.Div([
+                        dbc.Checklist(
+                            id="download-custom-cols",
+                            options=[],
+                            value=[],
+                            style={"fontSize": "0.82rem", "maxHeight": "300px", "overflowY": "auto",
+                                   "columns": "2", "columnGap": "20px"},
+                        ),
+                    ], id="download-col-picker-container"),
+                    id="download-col-picker-collapse",
+                    is_open=False,
+                ),
+            ]),
+            dbc.ModalFooter([
+                dcc.Loading(
+                    html.Span(id="download-loading-indicator"),
+                    type="circle", color=BOL_PALETTE["teal"],
+                    style={"display": "inline-block", "marginRight": "10px"},
+                ),
+                dbc.Button("Lejupielādēt", id="download-execute-btn", disabled=False,
+                          style={"backgroundColor": BOL_PALETTE["teal"], "color": "#fff",
+                                 "border": "none"}),
+            ]),
+        ], id="download-modal", is_open=False, size="lg"),
     ])
 
 
@@ -722,14 +1123,16 @@ clientside_callback(
     Output("custom-filter-toggle", "disabled"),
     Output("filter-breakdown-toggle", "disabled"),
     Output("plots-toggle", "disabled"),
+    Output("maps-toggle", "disabled"),
+    Output("custom-sample-toggle", "disabled"),
     Output("panel-loading-msg", "style"),
     Input("panel-enable-timer", "n_intervals"),
 )
-def _enable_panels(n_intervals: int) -> tuple[bool, bool, bool, bool, dict]:
+def _enable_panels(n_intervals: int) -> tuple[bool, bool, bool, bool, bool, bool, dict]:
     if n_intervals < 1:
-        return True, True, True, True, {"fontSize": "0.82rem", "color": "#6c757d",
+        return True, True, True, True, True, True, {"fontSize": "0.82rem", "color": "#6c757d",
                                                 "fontStyle": "italic", "marginBottom": "6px"}
-    return False, False, False, False, {"display": "none"}
+    return False, False, False, False, False, False, {"display": "none"}
 
 
 @callback(
@@ -773,6 +1176,19 @@ def _toggle_plots(n_clicks: int | None, lang: str | None) -> tuple[bool, str]:
 
 
 @callback(
+    Output("maps-collapse", "is_open"),
+    Output("maps-toggle", "children"),
+    Input("maps-toggle", "n_clicks"),
+    State("lang-store", "data"),
+    prevent_initial_call=True,
+)
+def _toggle_maps(n_clicks: int | None, lang: str | None) -> tuple[bool, str]:
+    lang = lang or "lv"
+    is_open = (n_clicks or 0) % 2 == 1
+    return is_open, f"{t('btn.maps', lang)} {'▲' if is_open else '▼'}"
+
+
+@callback(
     Output("filter-breakdown-collapse", "is_open"),
     Output("filter-breakdown-toggle", "children"),
     Input("filter-breakdown-toggle", "n_clicks"),
@@ -785,22 +1201,480 @@ def _toggle_filter_breakdown(n_clicks: int | None, lang: str | None) -> tuple[bo
     return is_open, f"{t('btn.filter_breakdown', lang)} {'\u25b2' if is_open else '\u25bc'}"
 
 
+# Custom Sample panel toggle
+@callback(
+    Output("custom-sample-collapse", "is_open"),
+    Output("custom-sample-toggle", "children"),
+    Input("custom-sample-toggle", "n_clicks"),
+    State("lang-store", "data"),
+    prevent_initial_call=True,
+)
+def _toggle_custom_sample(n_clicks: int | None, lang: str | None) -> tuple[bool, str]:
+    lang = lang or "lv"
+    is_open = (n_clicks or 0) % 2 == 1
+    return is_open, f"{t('btn.custom_sample', lang)} {'\u25b2' if is_open else '\u25bc'}"
+
+
+# ---------------------------------------------------------------------------
+# Maps panel: dot map with pagination
+# ---------------------------------------------------------------------------
+_MAPS_PAGE_SIZE = 10000
+
+
+@callback(
+    Output("maps-dot-map", "figure"),
+    Output("maps-page-info", "children"),
+    Output("maps-page-prev", "disabled"),
+    Output("maps-page-next", "disabled"),
+    Output("maps-page-store", "data"),
+    Input("maps-collapse", "is_open"),
+    Input("maps-page-prev", "n_clicks"),
+    Input("maps-page-next", "n_clicks"),
+    Input("filter-chain", "children"),
+    State("maps-page-store", "data"),
+    State("lang-store", "data"),
+    # Filter stores — query DuckDB directly
+    State("search-terms-store", "data"),
+    State("search-mode", "data"),
+    State("epc-slicer-store", "data"),
+    State("era-slicer-store", "data"),
+    State("floor-slicer-store", "data"),
+    State("wall-slicer-store", "data"),
+    State("type-slicer-store", "data"),
+    State("map-selected-territory", "data"),
+    State("custom-sample-store", "data"),
+    prevent_initial_call=True,
+)
+def _render_maps_dot_map(
+    is_open: bool,
+    prev_clicks: int | None,
+    next_clicks: int | None,
+    filter_chain_children,
+    current_page: int,
+    lang: str | None,
+    terms: list[str] | None,
+    search_mode: str | None,
+    epc_classes: list[str] | None,
+    eras: list[str] | None,
+    floors: list[str] | None,
+    walls: list[str] | None,
+    btypes: list[str] | None,
+    map_territory: str | None,
+    custom_sample: list[str] | None,
+):
+    from dash import ctx, no_update
+
+    if not is_open:
+        return no_update, no_update, no_update, no_update, no_update
+
+    lang = lang or "lv"
+
+    # Query DuckDB directly for ALL filtered buildings with coordinates
+    cols_needed = [
+        "KadastraApzimBuilding", "lat_4326", "lon_4326",
+        "Street", "House", "Town_Parish",
+        "construction_year", "BuildingGroundFloors",
+        "epc_class_cert", "epc_class_georiga",
+        "predicted_epc_class", "combined_epc_class",
+        "combined_heating_kwh",
+    ]
+    rows_data, agg = _search_filter_duckdb(
+        terms or [], search_mode or "any",
+        epc_classes or list(EPC_CLASSES_DISPLAY) + ["N/A"],
+        eras or list(ERA_BINS) + ["N/A"],
+        walls or list(WALL_MATERIALS) + ["N/A"],
+        cols_needed, map_territory, cols_needed,
+        page_offset=0, page_size=999999999,
+        custom_sample=custom_sample or [],
+        floors=floors or list(FLOOR_GROUPS) + ["N/A"],
+        btypes=btypes or list(BUILDING_TYPES),
+    )
+
+    # Filter to rows with valid coordinates
+    rows_with_coords = []
+    for r in rows_data:
+        lat = r.get("lat_4326")
+        lon = r.get("lon_4326")
+        if lat is not None and lon is not None and lat != "" and lon != "":
+            try:
+                float(lat); float(lon)
+                rows_with_coords.append(r)
+            except (ValueError, TypeError):
+                continue
+
+    total = len(rows_with_coords)
+    max_page = max(0, (total - 1) // _MAPS_PAGE_SIZE) if total > 0 else 0
+
+    # Handle pagination
+    triggered = ctx.triggered_id
+    page = current_page or 0
+    if triggered == "maps-page-next":
+        page = min(page + 1, max_page)
+    elif triggered == "maps-page-prev":
+        page = max(page - 1, 0)
+    elif triggered in ("maps-collapse", "filter-chain"):
+        page = 0
+
+    start = page * _MAPS_PAGE_SIZE
+    end = min(start + _MAPS_PAGE_SIZE, total)
+    page_rows = rows_with_coords[start:end]
+
+    # Build Plotly Scattermapbox
+    fl_label = "St\u0101vi" if lang == "lv" else "Floors"
+    yr_label = "B\u016bvgads" if lang == "lv" else "Year"
+    cert_label = "Sert." if lang == "lv" else "Cert"
+    geo_label = "GeoR." if lang == "lv" else "GeoR"
+    pred_label = "Progn." if lang == "lv" else "Pred"
+    comb_label = "Komb." if lang == "lv" else "Comb"
+
+    lats, lons, hover_texts, cadastre_ids, dot_colors = [], [], [], [], []
+    default_color = "#999999"
+    for r in page_rows:
+        lats.append(float(r["lat_4326"]))
+        lons.append(float(r["lon_4326"]))
+        cadastre_ids.append(r.get("KadastraApzimBuilding", ""))
+        epc_cls = r.get("combined_epc_class") or None
+        dot_colors.append(EPC_PALETTE.get(epc_cls, default_color))
+        # Hover text
+        addr_parts = []
+        for fld in ("Street", "House", "Town_Parish"):
+            v = r.get(fld)
+            if v and str(v) not in ("", "None", "nan"):
+                addr_parts.append(str(v))
+        addr = ", ".join(addr_parts) if addr_parts else "\u2014"
+        yr = r.get("construction_year", "\u2014")
+        if yr and yr != "\u2014":
+            try:
+                yr = int(float(yr))
+            except (ValueError, TypeError):
+                pass
+        floors_val = r.get("BuildingGroundFloors")
+        fl_str = str(int(float(floors_val))) if floors_val is not None and floors_val != "" else "\u2014"
+        epc_cert = r.get("epc_class_cert") or "\u2014"
+        epc_geo = r.get("epc_class_georiga") or "\u2014"
+        epc_pred = r.get("predicted_epc_class") or "\u2014"
+        epc_comb = r.get("combined_epc_class") or "\u2014"
+        kwh = r.get("combined_heating_kwh")
+        kwh_str = f"{float(kwh):.0f}" if kwh and kwh != "" else "\u2014"
+        hover_texts.append(
+            f"<b>{r.get('KadastraApzimBuilding', '')}</b><br>"
+            f"{addr}<br>"
+            f"{yr_label}: {yr} | {fl_label}: {fl_str}<br>"
+            f"EPC {cert_label}: {epc_cert} | {geo_label}: {epc_geo}<br>"
+            f"EPC {pred_label}: {epc_pred} | {comb_label}: {epc_comb}<br>"
+            f"kWh/m\u00b2: {kwh_str}"
+        )
+
+    fig = go.Figure()
+    if lats:
+        fig.add_trace(go.Scattermapbox(
+            lat=lats, lon=lons, mode="markers",
+            marker=dict(size=12, color=dot_colors, opacity=0.75),
+            text=hover_texts, hoverinfo="text",
+            hoverlabel=dict(bgcolor="white", bordercolor="#ccc",
+                            font=dict(size=11, color="#333")),
+            customdata=cadastre_ids,
+        ))
+
+    geojson = _load_geojson()
+    fig.update_layout(
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=56.95, lon=24.1),
+            zoom=6,
+            layers=[{"source": geojson, "type": "line",
+                     "color": "#555", "line": {"width": 1.5}}],
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        showlegend=False,
+        dragmode="pan",
+    )
+
+    # Page info
+    if total == 0:
+        info = "Nav koordin\u0101tu" if lang == "lv" else "No coordinates"
+    else:
+        info = f"{start + 1}\u2013{end} / {total}"
+
+    return fig, info, page <= 0, page >= max_page, page
+
+
+# Maps panel: click dot → open detail panel
+@callback(
+    Output("detail-panel", "is_open", allow_duplicate=True),
+    Output("detail-panel-content", "children", allow_duplicate=True),
+    Input("maps-dot-map", "clickData"),
+    State("lang-store", "data"),
+    prevent_initial_call=True,
+)
+def _maps_dot_click(click_data, lang):
+    from dash import no_update
+    lang = lang or "lv"
+    if not click_data:
+        return no_update, no_update
+    point = click_data.get("points", [{}])[0]
+    cadastre = point.get("customdata", "")
+    if isinstance(cadastre, list):
+        cadastre = cadastre[0] if cadastre else ""
+    cadastre = str(cadastre)
+    if not cadastre:
+        return no_update, no_update
+    con = _get_duckdb_con()
+    df = con.execute(
+        'SELECT * FROM buildings WHERE "KadastraApzimBuilding" = ? LIMIT 1',
+        [cadastre],
+    ).fetchdf()
+    if df.empty:
+        return no_update, no_update
+    row = df.iloc[0].to_dict()
+    rows = []
+    for col, val in row.items():
+        display = get_display_name(col, lang)
+        if col in ("EnergoefektivKlase", "EnergoefektivKlase_georiga_pref",
+                   "epc_class_cert", "epc_class_georiga", "combined_epc_class",
+                   "predicted_epc_class") and val in EPC_PALETTE:
+            val_el = html.Span(val, style={
+                "backgroundColor": EPC_PALETTE[val], "color": "#FFFFFF",
+                "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "700",
+            })
+        elif isinstance(val, float):
+            val_el = f"{val:.1f}"
+        else:
+            val_el = str(val) if val is not None else "\u2014"
+        rows.append(html.Tr([html.Td(display, style={"fontWeight": "600"}), html.Td(val_el)]))
+    return True, dbc.Table([html.Tbody(rows)], bordered=True, size="sm", style={"fontSize": "0.85rem"})
+
+
+# Color Custom Sample button when custom sample is active
+@callback(
+    Output("custom-sample-toggle", "color"),
+    Input("custom-sample-store", "data"),
+)
+def _color_custom_sample_btn(sample: list[str]) -> str:
+    return "info" if sample else "secondary"
+
+
+# Toggle format help inside custom sample panel
+@callback(
+    Output("custom-sample-format-collapse", "is_open"),
+    Input("custom-sample-format-link", "n_clicks"),
+    State("custom-sample-format-collapse", "is_open"),
+    prevent_initial_call=True,
+)
+def _toggle_format_help(n_clicks: int | None, is_open: bool) -> bool:
+    return not is_open
+
+
+# Close confirm modal on cancel
+@callback(
+    Output("custom-sample-confirm-modal", "is_open", allow_duplicate=True),
+    Input("custom-sample-confirm-no", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _close_confirm_modal(_n: int) -> bool:
+    return False
+
+
+def _parse_designations(text: str) -> tuple[list[str], list[str]]:
+    """Parse pasted text into valid and invalid cadastral designations.
+
+    Accepts comma, semicolon, space, tab, newline as separators.
+    Valid designation: exactly 14 digits.
+    Returns (valid_list, invalid_list).
+    """
+    import re
+    # Split on any common separator
+    tokens = re.split(r'[,;\s\t\n\r]+', text.strip())
+    tokens = [t.strip() for t in tokens if t.strip()]
+    valid = []
+    invalid = []
+    for tok in tokens:
+        if re.fullmatch(r'\d{14}', tok):
+            valid.append(tok)
+        else:
+            invalid.append(tok)
+    return valid, invalid
+
+
+# Main custom sample load/add/clear callback
+@callback(
+    Output("custom-sample-store", "data"),
+    Output("custom-sample-result", "children"),
+    Output("custom-sample-invalid-collapse", "is_open"),
+    Output("custom-sample-invalid-list", "children"),
+    Output("custom-sample-add-btn", "disabled"),
+    Output("custom-sample-clear-btn", "disabled"),
+    Output("custom-sample-input", "value"),
+    Output("custom-sample-confirm-modal", "is_open"),
+    # Reset other filters when loading new sample
+    Output("epc-slicer-store", "data", allow_duplicate=True),
+    Output("era-slicer-store", "data", allow_duplicate=True),
+    Output("floor-slicer-store", "data", allow_duplicate=True),
+    Output("wall-slicer-store", "data", allow_duplicate=True),
+    Output("type-slicer-store", "data", allow_duplicate=True),
+    Output("map-selected-territory", "data", allow_duplicate=True),
+    Output("search-terms-store", "data", allow_duplicate=True),
+    Input("custom-sample-load-btn", "n_clicks"),
+    Input("custom-sample-add-btn", "n_clicks"),
+    Input("custom-sample-clear-btn", "n_clicks"),
+    Input("custom-sample-confirm-yes", "n_clicks"),
+    State("custom-sample-input", "value"),
+    State("custom-sample-store", "data"),
+    State("lang-store", "data"),
+    State("epc-slicer-store", "data"),
+    State("era-slicer-store", "data"),
+    State("floor-slicer-store", "data"),
+    State("wall-slicer-store", "data"),
+    State("type-slicer-store", "data"),
+    State("map-selected-territory", "data"),
+    State("search-terms-store", "data"),
+    prevent_initial_call=True,
+)
+def _custom_sample_action(
+    load_clicks: int | None, add_clicks: int | None, clear_clicks: int | None,
+    confirm_clicks: int | None,
+    text: str | None, current_sample: list[str], lang: str | None,
+    epc_classes: list[str], eras: list[str], floors: list[str], walls: list[str],
+    btypes: list[str],
+    map_territory: str | None, search_terms: list[str],
+) -> tuple:
+    from dash import no_update
+    lang = lang or "lv"
+    triggered = ctx.triggered_id
+    NO = no_update
+    # 14 outputs total
+    noop = (NO,) * 15
+
+    if triggered == "custom-sample-clear-btn":
+        return (
+            [],  # clear store
+            html.Span("✓", style={"color": "green"}),
+            False, "",  # hide invalid list
+            True, True,  # disable add/clear buttons
+            "",  # clear textarea
+            False,  # don't show confirm dialog
+            # Don't reset other filters on clear
+            NO, NO, NO, NO, NO, NO, NO,
+        )
+
+    # Check if filters are active (for load only)
+    def _has_active_filters() -> bool:
+        all_epc = len(EPC_CLASSES_DISPLAY) + 1
+        all_eras_n = len(ERA_BINS) + 1
+        all_floors_n = len(FLOOR_GROUPS) + 1
+        all_walls_n = len(WALL_MATERIALS) + 1
+        return (
+            (epc_classes and len(epc_classes) < all_epc)
+            or (eras and len(eras) < all_eras_n)
+            or (floors and len(floors) < all_floors_n)
+            or (walls and len(walls) < all_walls_n)
+            or (btypes and len(btypes) < (len(BUILDING_TYPES) + 1))
+            or bool(map_territory)
+            or bool(search_terms)
+        )
+
+    if triggered == "custom-sample-load-btn":
+        if _has_active_filters():
+            # Show confirm dialog, don't proceed yet
+            return (NO, NO, NO, NO, NO, NO, NO, True, NO, NO, NO, NO, NO, NO, NO)
+        # Fall through to load logic below
+
+    if triggered in ("custom-sample-load-btn", "custom-sample-confirm-yes", "custom-sample-add-btn"):
+        if not text or not text.strip():
+            return (NO, html.Span("⚠ " + ("No text pasted." if lang == "en" else "Nav ielīmēts teksts."),
+                                   style={"color": "orange"}),
+                    False, "", NO, NO, NO, False, NO, NO, NO, NO, NO, NO, NO)
+
+        valid, invalid = _parse_designations(text)
+
+        if not valid:
+            return (NO,
+                    html.Span("⚠ " + ("No valid designations found." if lang == "en" else "Nav atrasti derīgi apzīmējumi."),
+                              style={"color": "red"}),
+                    bool(invalid), "\n".join(invalid),
+                    NO, NO, NO, False, NO, NO, NO, NO, NO, NO, NO)
+
+        # Check against DuckDB
+        con = _get_duckdb_con()
+        placeholders = ", ".join("?" for _ in valid)
+        found_rows = con.execute(
+            f'SELECT DISTINCT "KadastraApzimBuilding" FROM buildings '
+            f'WHERE "KadastraApzimBuilding" IN ({placeholders})',
+            valid,
+        ).fetchdf()
+        found_set = set(found_rows["KadastraApzimBuilding"])
+        not_found = [v for v in valid if v not in found_set]
+
+        if triggered == "custom-sample-add-btn":
+            existing = set(current_sample or [])
+            new_matches = [v for v in valid if v in found_set and v not in existing]
+            merged = list(existing | (set(valid) & found_set))
+            msg = t("custom.result_added", lang).format(
+                matched=len(new_matches), total=len(valid),
+                grand_total=len(merged),
+                not_found=len(not_found), invalid=len(invalid),
+            )
+            result_el = html.Div([
+                html.Span("✓ ", style={"color": "green", "fontWeight": "bold"}),
+                html.Pre(msg, style={"display": "inline", "whiteSpace": "pre-wrap", "margin": 0,
+                                     "fontSize": "0.82rem"}),
+            ])
+            return (
+                merged, result_el,
+                bool(invalid), "\n".join(invalid) if invalid else "",
+                False, False, "", False,
+                NO, NO, NO, NO, NO, NO, NO,
+            )
+        else:
+            # Load new sample (or confirmed load after dialog)
+            matched = list(found_set)
+            msg = t("custom.result_success", lang).format(
+                matched=len(matched), total=len(valid),
+                pct=round(100 * len(matched) / len(valid), 1) if valid else 0,
+                not_found=len(not_found), invalid=len(invalid),
+            )
+            result_el = html.Div([
+                html.Span("✓ ", style={"color": "green", "fontWeight": "bold"}),
+                html.Pre(msg, style={"display": "inline", "whiteSpace": "pre-wrap", "margin": 0,
+                                     "fontSize": "0.82rem"}),
+            ])
+            all_epc = list(EPC_CLASSES_DISPLAY) + ["N/A"]
+            all_eras_list = list(ERA_BINS) + ["N/A"]
+            all_floors_list = list(FLOOR_GROUPS) + ["N/A"]
+            all_walls_list = list(WALL_MATERIALS) + ["N/A"]
+            all_types_list = list(BUILDING_TYPES)
+            return (
+                matched, result_el,
+                bool(invalid), "\n".join(invalid) if invalid else "",
+                False, False, "", False,
+                all_epc, all_eras_list, all_floors_list, all_walls_list, all_types_list, None, [],
+            )
+
+    return noop
+
+
 # Color Custom Filters button teal when any slicer or map is active
 @callback(
     Output("custom-filter-toggle", "color"),
     Input("epc-slicer-store", "data"),
     Input("era-slicer-store", "data"),
+    Input("floor-slicer-store", "data"),
     Input("wall-slicer-store", "data"),
+    Input("type-slicer-store", "data"),
     Input("map-selected-territory", "data"),
 )
-def _color_custom_filter_btn(epc: list[str], eras: list[str], walls: list[str], map_sel: str | None) -> str:
+def _color_custom_filter_btn(epc: list[str], eras: list[str], floors: list[str], walls: list[str], btypes: list[str], map_sel: str | None) -> str:
     all_epc = len(EPC_CLASSES_DISPLAY) + 1  # +1 for N/A
     all_eras = len(ERA_BINS) + 1
+    all_floors = len(FLOOR_GROUPS) + 1
     all_walls = len(WALL_MATERIALS) + 1
+    all_types = len(BUILDING_TYPES)
     has_filter = (
         len(epc) < all_epc
         or len(eras) < all_eras
+        or len(floors) < all_floors
         or len(walls) < all_walls
+        or len(btypes) < all_types
         or bool(map_sel)
     )
     return "info" if has_filter else "secondary"
@@ -811,7 +1685,7 @@ def _color_custom_filter_btn(epc: list[str], eras: list[str], walls: list[str], 
     Output("search-mode", "data"),
     Output("search-mode-label", "children"),
     Input("search-mode-switch", "value"),
-    State("lang-store", "data"),
+    Input("lang-store", "data"),
 )
 def _sync_search_mode(is_all: bool, lang: str | None) -> tuple[str, str]:
     lang = lang or "lv"
@@ -824,7 +1698,7 @@ def _sync_search_mode(is_all: bool, lang: str | None) -> tuple[str, str]:
     Output("slicer-mode-store", "data"),
     Output("slicer-mode-label", "children"),
     Input("slicer-mode-switch", "value"),
-    State("lang-store", "data"),
+    Input("lang-store", "data"),
 )
 def _sync_slicer_mode(is_single: bool, lang: str | None) -> tuple[str, str]:
     lang = lang or "lv"
@@ -861,10 +1735,13 @@ def _toggle_row_badge(chain_children: list | str | None, breakdown_open: bool) -
 
 
 @callback(
-    Output("explorer-grid", "columnDefs"),
+    Output("explorer-grid", "columnDefs", allow_duplicate=True),
     Input({"type": "col-display", "block": ALL}, "value"),
+    State("lang-store", "data"),
+    prevent_initial_call=True,
 )
-def _update_columns(block_values: list[list[str]]) -> list[dict]:
+def _update_columns(block_values: list[list[str]], lang: str | None) -> list[dict]:
+    lang = lang or "lv"
     selected = [c for block in block_values for c in block]
     all_cols = list(EPC_TABLE_COLUMNS)
     try:
@@ -875,7 +1752,7 @@ def _update_columns(block_values: list[list[str]]) -> list[dict]:
         dtypes = {name: dtype for name, dtype in schema}
     except Exception:
         dtypes = {}
-    return _make_column_defs(selected, all_cols, dtypes)
+    return _make_column_defs(selected, all_cols, dtypes, lang=lang)
 
 
 # ---------------------------------------------------------------------------
@@ -902,6 +1779,10 @@ def _search_filter_duckdb(
     loaded_cols: list[str], map_territory: str | None,
     selected_cols: list[str],
     page_offset: int = 0,
+    page_size: int = 1000,
+    custom_sample: list[str] | None = None,
+    floors: list[str] | None = None,
+    btypes: list[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """Query DuckDB for full residential dataset with filters applied server-side."""
     con = _get_duckdb_con()
@@ -916,10 +1797,24 @@ def _search_filter_duckdb(
     conditions: list[str] = []
     params: list = []
 
-    # Territory filter
+    # Custom sample filter (always first priority)
+    if custom_sample:
+        placeholders = ", ".join("?" for _ in custom_sample)
+        conditions.append(f'"KadastraApzimBuilding" IN ({placeholders})')
+        params.extend(custom_sample)
+
+    # Territory / neighbourhood filter
     if map_territory:
         if map_territory == "__NA__":
             conditions.append("gis_territory_name IS NULL")
+        elif map_territory.startswith("__RIGA__:"):
+            neighbourhood = map_territory[9:]
+            conditions.append("apkaime_name = ?")
+            params.append(neighbourhood)
+        elif map_territory.startswith("__DGP__:"):
+            neighbourhood = map_territory[8:]
+            conditions.append("apkaime_name = ?")
+            params.append(neighbourhood)
         else:
             conditions.append("gis_territory_name = ?")
             params.append(map_territory)
@@ -940,6 +1835,26 @@ def _search_filter_duckdb(
         elif era_na:
             conditions.append("era_bin IS NULL")
 
+    # Floor count slicer (with N/A support)
+    floors = floors or []
+    floor_vals = [f for f in floors if f != "N/A"]
+    floor_na = "N/A" in floors
+    all_floors_count = len(FLOOR_GROUPS) + 1
+    if floors and len(floors) < all_floors_count:
+        # Build SQL CASE expression to map raw values to groups
+        range_parts: list[str] = []
+        for fv in floor_vals:
+            if fv == "10+":
+                range_parts.append('"BuildingGroundFloors" >= 10')
+            else:
+                range_parts.append(f'"BuildingGroundFloors" = {int(fv)}')
+        if range_parts and floor_na:
+            conditions.append(f"({' OR '.join(range_parts)} OR \"BuildingGroundFloors\" IS NULL OR \"BuildingGroundFloors\" <= 0)")
+        elif range_parts:
+            conditions.append(f"({' OR '.join(range_parts)})")
+        elif floor_na:
+            conditions.append('("BuildingGroundFloors" IS NULL OR "BuildingGroundFloors" <= 0)')
+
     # Wall material slicer (with N/A support)
     wall_vals = [w for w in walls if w != "N/A"]
     wall_na = "N/A" in walls
@@ -955,6 +1870,14 @@ def _search_filter_duckdb(
             params.extend(wall_vals)
         elif wall_na:
             conditions.append("wall_material_grouped IS NULL")
+
+    # Building type slicer (no NULLs — all rows classified)
+    btypes = btypes or []
+    all_types_count = len(BUILDING_TYPES)
+    if btypes and len(btypes) < all_types_count:
+        placeholders = ", ".join("?" for _ in btypes)
+        conditions.append(f"building_type IN ({placeholders})")
+        params.extend(btypes)
 
     # EPC class slicer (with N/A support, uses combined_epc_class)
     epc_vals = [c for c in epc_classes if c != "N/A"]
@@ -994,7 +1917,7 @@ def _search_filter_duckdb(
 
     # Get limited rows for table display (ordered by cadastre nr for stable pagination)
     offset_clause = f" OFFSET {page_offset}" if page_offset > 0 else ""
-    query = f"SELECT {select_clause} FROM buildings{where_clause} ORDER BY \"KadastraApzimBuilding\" LIMIT 5000{offset_clause}"
+    query = f"SELECT {select_clause} FROM buildings{where_clause} ORDER BY \"KadastraApzimBuilding\" LIMIT {page_size}{offset_clause}"
     df = con.execute(query, params).fetchdf()
 
     # Populate EnergoefektivKlase from combined_epc_class for grid display
@@ -1031,6 +1954,29 @@ def _search_filter_duckdb(
     agg["wall_dist"] = dict(zip(wall_agg["wall_material_grouped"], wall_agg["cnt"])) if len(wall_agg) > 0 else {}
     agg["wall_dist"]["N/A"] = total_count - sum(agg["wall_dist"].values())
 
+    # Floor count distribution
+    floor_q = f"SELECT CASE WHEN \"BuildingGroundFloors\" IS NULL OR \"BuildingGroundFloors\" <= 0 THEN 'N/A' WHEN \"BuildingGroundFloors\" >= 10 THEN '10+' ELSE CAST(CAST(\"BuildingGroundFloors\" AS INTEGER) AS VARCHAR) END as fg, COUNT(*) as cnt FROM buildings{where_clause} GROUP BY fg"
+    floor_agg = con.execute(floor_q, params).fetchdf()
+    agg["floor_dist"] = dict(zip(floor_agg["fg"], floor_agg["cnt"])) if len(floor_agg) > 0 else {}
+
+    # Building type distribution
+    type_extra = " AND building_type IS NOT NULL" if where_clause else " WHERE building_type IS NOT NULL"
+    type_agg = con.execute(
+        f"SELECT building_type, COUNT(*) as cnt FROM buildings{where_clause}{type_extra} GROUP BY building_type",
+        params,
+    ).fetchdf()
+    agg["type_dist"] = dict(zip(type_agg["building_type"], type_agg["cnt"])) if len(type_agg) > 0 else {}
+    agg["type_dist"]["N/A"] = total_count - sum(agg["type_dist"].values())
+
+    # Primary energy percentile distribution (20 bins of 5%)
+    pe_q = f"SELECT primary_energy_pctile FROM buildings{where_clause}" + (" AND" if where_clause else " WHERE") + " primary_energy_pctile IS NOT NULL"
+    pe_rows = con.execute(pe_q, params).fetchall()
+    pe_bins = [0] * 20
+    for (p,) in pe_rows:
+        idx = min(int(float(p) / 5.0), 19)
+        pe_bins[idx] += 1
+    agg["pe_pctile_dist"] = pe_bins
+
     # Average combined heating energy
     avg_q = f"SELECT AVG(combined_heating_kwh) FROM buildings{where_clause}"
     avg_result = con.execute(avg_q + " AND combined_heating_kwh IS NOT NULL" if where_clause else avg_q + " WHERE combined_heating_kwh IS NOT NULL", params).fetchone()
@@ -1049,38 +1995,49 @@ def _search_filter_duckdb(
     Input("search-mode", "data"),
     Input("epc-slicer-store", "data"),
     Input("era-slicer-store", "data"),
+    Input("floor-slicer-store", "data"),
     Input("wall-slicer-store", "data"),
+    Input("type-slicer-store", "data"),
     Input("initial-load-trigger", "data"),
     Input("map-selected-territory", "data"),
     Input("page-offset-store", "data"),
+    Input("page-size-store", "data"),
+    Input("custom-sample-store", "data"),
     State({"type": "col-display", "block": ALL}, "value"),
-    State("lang-store", "data"),
+    Input("lang-store", "data"),
 )
 def _search_filter(
     terms: list[str], mode: str, epc_classes: list[str],
-    eras: list[str], walls: list[str], _trigger: bool,
+    eras: list[str], floors: list[str], walls: list[str], btypes: list[str],
+    _trigger: bool,
     map_territory: str | None,
     page_offset: int,
+    page_size: int,
+    custom_sample: list[str],
     block_values: list[list[str]],
     lang: str | None,
 ) -> tuple[list[dict], dict | None, bool, bool, str]:
     lang = lang or "lv"
+    page_size = page_size or 1000
     selected_cols = [c for block in block_values for c in block]
     rows, agg = _search_filter_duckdb(
         terms, mode, epc_classes, eras, walls,
         selected_cols, map_territory, selected_cols,
-        page_offset=page_offset or 0,
+        page_offset=page_offset or 0, page_size=page_size,
+        custom_sample=custom_sample or [],
+        floors=floors or [],
+        btypes=btypes or [],
     )
     # Compute pagination state
     offset = page_offset or 0
     total = agg.get("total_count", 0) if agg else 0
-    page_num = offset // 5000 + 1
-    total_pages = max(1, (total + 4999) // 5000)
-    if total > 5000:
+    page_num = offset // page_size + 1
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    if total > page_size:
         label = t("page.of", lang).format(page=page_num, total=total_pages)
     else:
         label = t("page.buildings", lang).format(n=f"{total:,}")
-    return rows, agg, offset <= 0, offset + 5000 >= total, label
+    return rows, agg, offset <= 0, offset + page_size >= total, label
 
 
 # ---------------------------------------------------------------------------
@@ -1094,28 +2051,64 @@ def _search_filter(
     Input("search-terms-store", "data"),
     Input("epc-slicer-store", "data"),
     Input("era-slicer-store", "data"),
+    Input("floor-slicer-store", "data"),
     Input("wall-slicer-store", "data"),
+    Input("type-slicer-store", "data"),
     Input("map-selected-territory", "data"),
+    Input("custom-sample-store", "data"),
     State("page-offset-store", "data"),
     State("full-agg-store", "data"),
+    State("page-size-store", "data"),
     prevent_initial_call=True,
 )
 def _paginate(
     prev_clicks: int | None, next_clicks: int | None,
-    _terms: list, _epc: list, _eras: list, _walls: list, _territory: str | None,
-    current_offset: int, agg_data: dict | None,
+    _terms: list, _epc: list, _eras: list, _floors: list, _walls: list, _btypes: list,
+    _territory: str | None,
+    _custom: list,
+    current_offset: int, agg_data: dict | None, page_size: int,
 ) -> int:
     triggered = ctx.triggered_id
     total = agg_data.get("total_count", 0) if agg_data else 0
+    page_size = page_size or 1000
 
     if triggered == "page-prev-btn":
-        return max(0, (current_offset or 0) - 5000)
+        return max(0, (current_offset or 0) - page_size)
     elif triggered == "page-next-btn":
-        new_offset = (current_offset or 0) + 5000
+        new_offset = (current_offset or 0) + page_size
         return min(new_offset, max(0, total - 1))
     else:
         # Filter changed — reset to page 0
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Page size selector
+# ---------------------------------------------------------------------------
+_PAGE_SIZE_IDS = {
+    "page-size-1000": 1000,
+    "page-size-2000": 2000,
+    "page-size-5000": 5000,
+    "page-size-10000": 10000,
+}
+
+
+@callback(
+    Output("page-size-store", "data"),
+    Output("page-size-1000", "active"),
+    Output("page-size-2000", "active"),
+    Output("page-size-5000", "active"),
+    Output("page-size-10000", "active"),
+    Input("page-size-1000", "n_clicks"),
+    Input("page-size-2000", "n_clicks"),
+    Input("page-size-5000", "n_clicks"),
+    Input("page-size-10000", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _set_page_size(c1: int, c2: int, c3: int, c4: int) -> tuple[int, bool, bool, bool, bool]:
+    triggered = ctx.triggered_id
+    size = _PAGE_SIZE_IDS.get(triggered, 1000)
+    return size, size == 1000, size == 2000, size == 5000, size == 10000
 
 
 # Chip management: add term on Enter, remove on × click
@@ -1206,10 +2199,13 @@ def _render_chips(terms: list[str]) -> list:
     Input("search-mode", "data"),
     Input("epc-slicer-store", "data"),
     Input("era-slicer-store", "data"),
+    Input("floor-slicer-store", "data"),
     Input("wall-slicer-store", "data"),
+    Input("type-slicer-store", "data"),
     Input("map-selected-territory", "data"),
+    Input("custom-sample-store", "data"),
     Input("full-agg-store", "data"),
-    State("lang-store", "data"),
+    Input("lang-store", "data"),
 )
 def _update_filter_chain(
     filter_model: dict | None,
@@ -1217,8 +2213,11 @@ def _update_filter_chain(
     mode: str,
     epc_classes: list[str],
     eras: list[str],
+    floors: list[str],
     walls: list[str],
+    btypes: list[str],
     map_territory: str | None,
+    custom_sample: list[str],
     agg_data: dict | None,
     lang: str | None,
 ) -> list | str:
@@ -1226,16 +2225,21 @@ def _update_filter_chain(
     lang = lang or "lv"
     has_search = bool(terms)
     has_col_filters = bool(filter_model)
+    has_custom_sample = bool(custom_sample)
     # Include N/A in the count of "all" options
     all_epc_count = len(EPC_CLASSES_DISPLAY) + 1  # +1 for N/A
     all_era_count = len(ERA_BINS) + 1
+    all_floor_count = len(FLOOR_GROUPS) + 1
     all_wall_count = len(WALL_MATERIALS) + 1
+    all_type_count = len(BUILDING_TYPES) + 1
     has_epc_filter = bool(epc_classes) and len(epc_classes) < all_epc_count
     has_era_filter = bool(eras) and len(eras) < all_era_count
+    has_floor_filter = bool(floors) and len(floors) < all_floor_count
     has_wall_filter = bool(walls) and len(walls) < all_wall_count
+    has_type_filter = bool(btypes) and len(btypes) < all_type_count
     has_map_filter = bool(map_territory)
 
-    if not has_search and not has_col_filters and not has_epc_filter and not has_era_filter and not has_wall_filter and not has_map_filter:
+    if not has_search and not has_col_filters and not has_epc_filter and not has_era_filter and not has_floor_filter and not has_wall_filter and not has_type_filter and not has_map_filter and not has_custom_sample:
         return [html.Span(t("filter.no_active", lang), style={
             "fontSize": "0.82rem", "color": BOL_PALETTE["grey"], "fontStyle": "italic",
         })]
@@ -1256,6 +2260,17 @@ def _update_filter_chain(
         q = f"SELECT COUNT(*) FROM buildings WHERE {' AND '.join(conditions)}"
         return con.execute(q, params).fetchone()[0]
 
+    # Custom sample filter (always first)
+    if has_custom_sample:
+        before = _current_count()
+        placeholders = ", ".join("?" for _ in custom_sample)
+        conditions.append(f'"KadastraApzimBuilding" IN ({placeholders})')
+        params.extend(custom_sample)
+        after = _current_count()
+        removed = before - after
+        if removed > 0:
+            steps.append((t("filter.custom_step", lang) + f" ({len(custom_sample)})", removed))
+
     if has_epc_filter:
         before = _current_count()
         # Build EPC condition
@@ -1272,7 +2287,7 @@ def _update_filter_chain(
         after = _current_count()
         removed = before - after
         if removed > 0:
-            steps.append((f"EPC = {', '.join(epc_classes)}", removed))
+            steps.append((f"{t('filter.epc_step', lang)} = {', '.join(epc_classes)}", removed))
 
     if has_era_filter:
         before = _current_count()
@@ -1289,7 +2304,28 @@ def _update_filter_chain(
         after = _current_count()
         removed = before - after
         if removed > 0:
-            steps.append((f"Era = {', '.join(eras)}", removed))
+            steps.append((f"{t('filter.era_step', lang)} = {', '.join(eras)}", removed))
+
+    if has_floor_filter:
+        before = _current_count()
+        floor_vals = [f for f in floors if f != "N/A"]
+        floor_na = "N/A" in floors
+        range_parts: list[str] = []
+        for fv in floor_vals:
+            if fv == "10+":
+                range_parts.append('"BuildingGroundFloors" >= 10')
+            else:
+                range_parts.append(f'"BuildingGroundFloors" = {int(fv)}')
+        if range_parts and floor_na:
+            conditions.append(f"({' OR '.join(range_parts)} OR \"BuildingGroundFloors\" IS NULL OR \"BuildingGroundFloors\" <= 0)")
+        elif range_parts:
+            conditions.append(f"({' OR '.join(range_parts)})")
+        elif floor_na:
+            conditions.append('("BuildingGroundFloors" IS NULL OR "BuildingGroundFloors" <= 0)')
+        after = _current_count()
+        removed = before - after
+        if removed > 0:
+            steps.append((f"{t('filter.floor_step', lang)} = {', '.join(floors)}", removed))
 
     if has_wall_filter:
         before = _current_count()
@@ -1306,27 +2342,52 @@ def _update_filter_chain(
         after = _current_count()
         removed = before - after
         if removed > 0:
-            steps.append((f"Wall = {', '.join(walls)}", removed))
+            steps.append((f"{t('filter.wall_step', lang)} = {', '.join(walls)}", removed))
+
+    if has_type_filter:
+        before = _current_count()
+        placeholders = ','.join('?' for _ in btypes)
+        conditions.append(f"building_type IN ({placeholders})")
+        params.extend(btypes)
+        after = _current_count()
+        removed = before - after
+        if removed > 0:
+            steps.append((f"{t('filter.type_step', lang)} = {', '.join(btypes)}", removed))
 
     if has_map_filter:
         before = _current_count()
         if map_territory == "__NA__":
             conditions.append("gis_territory_name IS NULL")
+        elif map_territory.startswith("__RIGA__:"):
+            neighbourhood = map_territory[9:]
+            conditions.append("apkaime_name = ?")
+            params.append(neighbourhood)
+        elif map_territory.startswith("__DGP__:"):
+            neighbourhood = map_territory[8:]
+            conditions.append("apkaime_name = ?")
+            params.append(neighbourhood)
         else:
             conditions.append("gis_territory_name = ?")
             params.append(map_territory)
         after = _current_count()
         removed = before - after
         if removed > 0:
-            label = "No region (N/A)" if map_territory == "__NA__" else map_territory
-            steps.append((f"Map = {label}", removed))
+            if map_territory == "__NA__":
+                label = t("filter.no_region", lang)
+            elif map_territory.startswith("__RIGA__:"):
+                label = map_territory[9:]
+            elif map_territory.startswith("__DGP__:"):
+                label = map_territory[8:]
+            else:
+                label = map_territory
+            steps.append((f"{t('filter.map_step', lang)} = {label}", removed))
 
     if has_search:
-        terms_str = " & ".join(f'"{t}"' for t in terms) if mode == "all" else " | ".join(f'"{t}"' for t in terms)
+        terms_str = " & ".join(f'"{term}"' for term in terms) if mode == "all" else " | ".join(f'"{term}"' for term in terms)
         before = _current_count()
         removed = before - filtered_total
         if removed > 0:
-            steps.append((f"search {terms_str}", removed))
+            steps.append((f"{t('filter.search_step', lang)} {terms_str}", removed))
 
     # Build pill-style visual chain
     pill_base: dict = {
@@ -1498,6 +2559,61 @@ def _update_era_styles(selected: list[str]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Floor Slicer callbacks
+# ---------------------------------------------------------------------------
+@callback(
+    Output("floor-slicer-store", "data"),
+    Input({"type": "floor-slicer", "index": ALL}, "n_clicks"),
+    Input("floor-slicer-all", "n_clicks"),
+    State("floor-slicer-store", "data"),
+    State("slicer-mode-store", "data"),
+    prevent_initial_call=True,
+)
+def _toggle_floor_slicer(
+    floor_clicks: list[int], all_clicks: int, current: list[str], mode: str,
+) -> list[str]:
+    triggered = ctx.triggered_id
+    if triggered == "floor-slicer-all":
+        return list(FLOOR_GROUPS) + ["N/A"]
+    if isinstance(triggered, dict) and triggered.get("type") == "floor-slicer":
+        fg = triggered["index"]
+        all_options = list(FLOOR_GROUPS) + ["N/A"]
+        if mode == "single":
+            return [fg]
+        if fg in current:
+            new = [f for f in current if f != fg]
+            return new if new else all_options
+        else:
+            return current + [fg]
+    return current
+
+
+@callback(
+    Output({"type": "floor-slicer", "index": ALL}, "style"),
+    Input("floor-slicer-store", "data"),
+)
+def _update_floor_styles(selected: list[str]) -> list[dict]:
+    styles = []
+    all_buttons = list(FLOOR_GROUPS) + ["N/A"]
+    for fg in all_buttons:
+        active = fg in selected
+        bg = BOL_PALETTE["accent1"] if fg != "N/A" else "#BDBDBD"
+        styles.append({
+            "backgroundColor": bg if active else "#E0E0E5",
+            "color": "#FFFFFF" if active else "#999",
+            "border": f"2px solid {bg}" if active else "2px solid transparent",
+            "borderRadius": "16px",
+            "padding": "4px 12px",
+            "marginRight": "4px",
+            "fontWeight": "500",
+            "fontSize": "0.8rem",
+            "cursor": "pointer",
+            "opacity": "1" if active else "0.5",
+        })
+    return styles
+
+
+# ---------------------------------------------------------------------------
 # Wall Material Slicer callbacks
 # ---------------------------------------------------------------------------
 @callback(
@@ -1553,6 +2669,61 @@ def _update_wall_styles(selected: list[str]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Building Type Slicer callbacks
+# ---------------------------------------------------------------------------
+@callback(
+    Output("type-slicer-store", "data"),
+    Input({"type": "type-slicer", "index": ALL}, "n_clicks"),
+    Input("type-slicer-all", "n_clicks"),
+    State("type-slicer-store", "data"),
+    State("slicer-mode-store", "data"),
+    prevent_initial_call=True,
+)
+def _toggle_type_slicer(
+    type_clicks: list[int], all_clicks: int, current: list[str], mode: str,
+) -> list[str]:
+    triggered = ctx.triggered_id
+    if triggered == "type-slicer-all":
+        return list(BUILDING_TYPES)
+    if isinstance(triggered, dict) and triggered.get("type") == "type-slicer":
+        bt = triggered["index"]
+        all_options = list(BUILDING_TYPES)
+        if mode == "single":
+            return [bt]
+        if bt in current:
+            new = [b for b in current if b != bt]
+            return new if new else all_options
+        else:
+            return current + [bt]
+    return current
+
+
+@callback(
+    Output({"type": "type-slicer", "index": ALL}, "style"),
+    Input("type-slicer-store", "data"),
+)
+def _update_type_styles(selected: list[str]) -> list[dict]:
+    styles = []
+    all_buttons = list(BUILDING_TYPES)
+    for bt in all_buttons:
+        active = bt in selected
+        bg = BOL_PALETTE["accent1"]
+        styles.append({
+            "backgroundColor": bg if active else "#E0E0E5",
+            "color": "#FFFFFF" if active else "#999",
+            "border": f"2px solid {bg}" if active else "2px solid transparent",
+            "borderRadius": "16px",
+            "padding": "4px 12px",
+            "marginRight": "4px",
+            "fontWeight": "500",
+            "fontSize": "0.8rem",
+            "cursor": "pointer",
+            "opacity": "1" if active else "0.5",
+        })
+    return styles
+
+
+# ---------------------------------------------------------------------------
 # Mini EPC distribution chart (horizontal bars, A on top)
 # ---------------------------------------------------------------------------
 
@@ -1578,8 +2749,8 @@ def _get_full_epc_counts() -> dict[str, int]:
     Input("plot-checklist", "value"),
     Input("chart-ref-toggle", "value"),
     Input("full-agg-store", "data"),
-    State("plots-collapse", "is_open"),
-    State("lang-store", "data"),
+    Input("plots-collapse", "is_open"),
+    Input("lang-store", "data"),
 )
 def _update_mini_chart(virtual_data: list[dict] | None, plots: list[str] | None, show_ref: bool, agg_data: dict | None, panel_open: bool, lang: str | None) -> tuple:
     """Show a minimalistic horizontal bar chart of EPC class distribution."""
@@ -1786,8 +2957,8 @@ ERA_COLORS["N/A"] = "#999"
     Input("plot-checklist", "value"),
     Input("chart-ref-toggle", "value"),
     Input("full-agg-store", "data"),
-    State("plots-collapse", "is_open"),
-    State("lang-store", "data"),
+    Input("plots-collapse", "is_open"),
+    Input("lang-store", "data"),
 )
 def _update_era_chart(virtual_data: list[dict] | None, plots: list[str] | None, show_ref: bool, agg_data: dict | None, panel_open: bool, lang: str | None) -> tuple:
     lang = lang or "lv"
@@ -1813,8 +2984,8 @@ def _update_era_chart(virtual_data: list[dict] | None, plots: list[str] | None, 
     Input("plot-checklist", "value"),
     Input("chart-ref-toggle", "value"),
     Input("full-agg-store", "data"),
-    State("plots-collapse", "is_open"),
-    State("lang-store", "data"),
+    Input("plots-collapse", "is_open"),
+    Input("lang-store", "data"),
 )
 def _update_wall_chart(virtual_data: list[dict] | None, plots: list[str] | None, show_ref: bool, agg_data: dict | None, panel_open: bool, lang: str | None) -> tuple:
     lang = lang or "lv"
@@ -1831,6 +3002,248 @@ def _update_wall_chart(virtual_data: list[dict] | None, plots: list[str] | None,
             if mat in WALL_COLORS:
                 counts[mat] = counts.get(mat, 0) + 1
     return _build_dist_chart(list(WALL_MATERIALS) + ["N/A"], counts, _get_full_wall_counts(), WALL_COLORS, show_ref, t("plot.wall_label", lang)), _PLOT_STYLE_VISIBLE
+
+
+# Precompute full-sample floor counts
+_FULL_FLOOR_COUNTS: dict[str, int] = {}
+
+
+def _get_full_floor_counts() -> dict[str, int]:
+    if not _FULL_FLOOR_COUNTS:
+        con = _get_duckdb_con()
+        rows = con.execute(
+            'SELECT CASE WHEN "BuildingGroundFloors" IS NULL OR "BuildingGroundFloors" <= 0 THEN \'N/A\' '
+            'WHEN "BuildingGroundFloors" >= 10 THEN \'10+\' '
+            'ELSE CAST(CAST("BuildingGroundFloors" AS INTEGER) AS VARCHAR) END as fg, COUNT(*) '
+            'FROM buildings GROUP BY fg'
+        ).fetchall()
+        for fg, cnt in rows:
+            _FULL_FLOOR_COUNTS[fg] = int(cnt)
+    return _FULL_FLOOR_COUNTS
+
+
+FLOOR_COLORS: dict[str, str] = {fg: BOL_PALETTE["accent1"] for fg in FLOOR_GROUPS}
+
+
+# Precomputed full-sample primary energy percentile bin counts (20 bins of 5%)
+_FULL_PE_COUNTS: list[int] | None = None
+
+
+def _get_full_pe_counts() -> list[int]:
+    global _FULL_PE_COUNTS
+    if _FULL_PE_COUNTS is None:
+        con = _get_duckdb_con()
+        n_bins = 20
+        bin_size = 100.0 / n_bins
+        _FULL_PE_COUNTS = [0] * n_bins
+        rows = con.execute(
+            "SELECT primary_energy_pctile FROM buildings WHERE primary_energy_pctile IS NOT NULL"
+        ).fetchall()
+        for (p,) in rows:
+            idx = min(int(float(p) / bin_size), n_bins - 1)
+            _FULL_PE_COUNTS[idx] += 1
+    return _FULL_PE_COUNTS
+FLOOR_COLORS["N/A"] = "#999"
+
+
+@callback(
+    Output("floor-mini-chart", "children"),
+    Output("floor-mini-chart", "style"),
+    Input("explorer-grid", "virtualRowData"),
+    Input("plot-checklist", "value"),
+    Input("chart-ref-toggle", "value"),
+    Input("full-agg-store", "data"),
+    Input("plots-collapse", "is_open"),
+    Input("lang-store", "data"),
+)
+def _update_floor_chart(virtual_data: list[dict] | None, plots: list[str] | None, show_ref: bool, agg_data: dict | None, panel_open: bool, lang: str | None) -> tuple:
+    lang = lang or "lv"
+    if not panel_open or not plots or "floor_dist" not in plots:
+        return html.Div(), _PLOT_STYLE_HIDDEN
+    if not virtual_data and not agg_data:
+        return html.Div(), _PLOT_STYLE_HIDDEN
+    if agg_data and "floor_dist" in agg_data:
+        counts = {k: v for k, v in agg_data["floor_dist"].items()}
+    else:
+        counts = {}
+        for row in (virtual_data or []):
+            fg = _floor_group(row.get("BuildingGroundFloors"))
+            counts[fg] = counts.get(fg, 0) + 1
+    return _build_dist_chart(list(FLOOR_GROUPS) + ["N/A"], counts, _get_full_floor_counts(), FLOOR_COLORS, show_ref, t("plot.floor_label", lang)), _PLOT_STYLE_VISIBLE
+
+
+# ---------------------------------------------------------------------------
+# Primary energy percentile distribution chart
+# ---------------------------------------------------------------------------
+
+
+@callback(
+    Output("primary-energy-chart", "children"),
+    Output("primary-energy-chart", "style"),
+    Input("explorer-grid", "virtualRowData"),
+    Input("plot-checklist", "value"),
+    Input("chart-ref-toggle", "value"),
+    Input("full-agg-store", "data"),
+    Input("plots-collapse", "is_open"),
+    Input("lang-store", "data"),
+)
+def _update_primary_energy_chart(virtual_data: list[dict] | None, plots: list[str] | None, show_ref: bool, agg_data: dict | None, panel_open: bool, lang: str | None) -> tuple:
+    lang = lang or "lv"
+    if not panel_open or not plots or "primary_energy_dist" not in plots:
+        return html.Div(), _PLOT_STYLE_HIDDEN
+
+    pctile_col = "primary_energy_pctile"
+
+    # Use precomputed aggregation from full filtered dataset (not just visible page)
+    n_bins = 20
+    bin_size = 100.0 / n_bins
+    if agg_data and "pe_pctile_dist" in agg_data:
+        bin_counts = list(agg_data["pe_pctile_dist"])
+    else:
+        # Fallback: count from virtual_data (only current page)
+        bin_counts = [0] * n_bins
+        for row in (virtual_data or []):
+            v = row.get(pctile_col)
+            if v is None or v == "":
+                continue
+            try:
+                idx = min(int(float(v) / bin_size), n_bins - 1)
+                bin_counts[idx] += 1
+            except (ValueError, TypeError):
+                continue
+
+    total = sum(bin_counts)
+    if total == 0:
+        return html.Div(
+            "Nav datu" if lang == "lv" else "No data",
+            style={"fontSize": "0.8rem", "color": BOL_PALETTE["grey"], "padding": "10px"},
+        ), _PLOT_STYLE_VISIBLE
+
+    # Full-sample reference counts
+    ref_counts: list[int] | None = None
+    ref_total = 0
+    if show_ref:
+        ref_counts = _get_full_pe_counts()
+        ref_total = sum(ref_counts) if ref_counts else 0
+
+    # 95% binomial CI on each bin count: count ± 1.96*sqrt(count*(1-p))
+    # where p = count/total
+    import math
+    ci_half = [0.0] * n_bins
+    for i in range(n_bins):
+        k = bin_counts[i]
+        if total > 1 and k > 0:
+            p_hat = k / total
+            ci_half[i] = 1.96 * math.sqrt(k * (1 - p_hat))
+
+    max_count = max(bin_counts) if bin_counts else 1
+    if ref_counts and show_ref:
+        # Scale ref to same total for visual comparison
+        scale = total / ref_total if ref_total > 0 else 1
+        ref_scaled = [c * scale for c in ref_counts]
+        max_count = max(max_count, max(ref_scaled) if ref_scaled else 0)
+    else:
+        ref_scaled = None
+
+    bars = []
+    for i in range(n_bins):
+        pct_start = i * bin_size
+        pct_end = (i + 1) * bin_size
+        count = bin_counts[i]
+        bar_w = count / max_count * 100 if max_count > 0 else 0
+        color = "#2E7D32" if i < 3 else "#BDBDBD"
+        pct_of_total = count / total * 100 if total > 0 else 0
+
+        label = f"{pct_start:.0f}-{pct_end:.0f}%"
+
+        # Build bar area: main bar first, then reference/CI overlaid on top
+        bar_children: list = []
+
+        # Main bar (bottom layer)
+        bar_children.append(html.Div(style={
+            "position": "absolute", "top": "0", "left": "0",
+            "height": "12px", "width": f"{max(bar_w, 0.5):.1f}%",
+            "backgroundColor": color, "borderRadius": "3px",
+            "transition": "width 0.3s", "minWidth": "2px",
+        }))
+
+        # Reference bar (dashed outline, on top of main bar so always visible)
+        if ref_scaled and show_ref:
+            ref_w = ref_scaled[i] / max_count * 100 if max_count > 0 else 0
+            bar_children.append(html.Div(style={
+                "position": "absolute", "top": "0", "left": "0",
+                "height": "12px", "width": f"{max(ref_w, 0.5):.1f}%",
+                "border": f"1.5px dashed {BOL_PALETTE['navy']}",
+                "borderRadius": "3px", "boxSizing": "border-box",
+                "zIndex": "2",
+            }))
+
+        # CI whisker (black line on top, always visible)
+        if ci_half[i] > 0 and total >= 30:
+            ci_lo_w = max(0, (count - ci_half[i]) / max_count * 100)
+            ci_hi_w = min(100, (count + ci_half[i]) / max_count * 100)
+            bar_children.append(html.Div(style={
+                "position": "absolute", "top": "4px",
+                "left": f"{ci_lo_w:.1f}%",
+                "height": "3px",
+                "width": f"{max(ci_hi_w - ci_lo_w, 0.5):.1f}%",
+                "backgroundColor": "#333333", "borderRadius": "1px",
+                "zIndex": "3",
+            }))
+
+        bars.append(
+            html.Div([
+                html.Span(label, style={
+                    "width": "55px", "fontWeight": "600", "fontSize": "0.70rem",
+                    "color": BOL_PALETTE["navy"], "flexShrink": "0",
+                }),
+                html.Div(
+                    bar_children,
+                    style={"flex": "1", "minWidth": "0", "position": "relative", "height": "12px"},
+                ),
+                html.Span(
+                    f" {count:,} ({pct_of_total:.1f}%)",
+                    style={"fontSize": "0.70rem", "color": BOL_PALETTE["navy"],
+                           "marginLeft": "4px", "whiteSpace": "nowrap"},
+                ),
+            ], style={"display": "flex", "alignItems": "center", "gap": "3px", "marginBottom": "0px"})
+        )
+
+    # EU taxonomy annotation
+    top15_count = sum(bin_counts[:3])
+    top15_pct = top15_count / total * 100 if total > 0 else 0
+    annotations: list = [html.Div(
+        f"{'ES taksonomija top 15%' if lang == 'lv' else 'EU Taxonomy top 15%'}: "
+        f"{top15_count:,} ({top15_pct:.1f}%)",
+        style={"fontSize": "0.72rem", "color": "#2E7D32", "fontWeight": "600",
+               "marginTop": "4px", "borderTop": f"1px solid {BOL_PALETTE['grey']}",
+               "paddingTop": "3px"},
+    )]
+
+    # CI legend
+    if total >= 30:
+        ci_note = "95% TI" if lang == "lv" else "95% CI"
+        annotations.append(html.Div([
+            html.Span("— ", style={"color": "#333333", "fontWeight": "bold"}),
+            html.Span(ci_note, style={"fontSize": "0.68rem", "color": BOL_PALETTE["grey"]}),
+        ], style={"marginTop": "2px"}))
+
+    title = "Primārās enerģijas procentīļu sadalījums" if lang == "lv" else "Primary Energy Percentile Distribution"
+
+    return html.Div([
+        html.Div(title, style={
+            "fontSize": "0.75rem", "fontWeight": "400", "color": BOL_PALETTE["grey"],
+            "marginBottom": "2px",
+        }),
+        html.Div(bars, style={"display": "flex", "flexDirection": "column", "justifyContent": "space-evenly", "flex": "1"}),
+        *annotations,
+    ], style={
+        "padding": "6px 10px",
+        "backgroundColor": BOL_PALETTE["bg"],
+        "borderRadius": "6px",
+        "marginBottom": "6px",
+        "display": "flex", "flexDirection": "column",
+    }), _PLOT_STYLE_VISIBLE
 
 
 # Precompute full-sample average energy
@@ -1855,8 +3268,8 @@ def _get_full_avg_energy() -> float:
     Input("explorer-grid", "virtualRowData"),
     Input("plot-checklist", "value"),
     Input("full-agg-store", "data"),
-    State("plots-collapse", "is_open"),
-    State("lang-store", "data"),
+    Input("plots-collapse", "is_open"),
+    Input("lang-store", "data"),
 )
 def _update_energy_gauge(virtual_data: list[dict] | None, plots: list[str] | None, agg_data: dict | None, panel_open: bool, lang: str | None) -> tuple:
     lang = lang or "lv"
@@ -1947,17 +3360,21 @@ def _update_energy_gauge(virtual_data: list[dict] | None, plots: list[str] | Non
     Output("detail-panel", "is_open"),
     Output("detail-panel-content", "children"),
     Input("explorer-grid", "selectedRows"),
+    State("lang-store", "data"),
     prevent_initial_call=True,
 )
-def _show_detail(selected: list[dict] | None) -> tuple[bool, html.Div]:
+def _show_detail(selected: list[dict] | None, lang: str | None) -> tuple[bool, html.Div]:
+    lang = lang or "lv"
     if not selected:
         return False, html.Div()
     row = selected[0]
     rows = []
     for col, val in row.items():
-        display = get_display_name(col)
+        display = get_display_name(col, lang)
         # EPC class → color badge
-        if col in ("EnergoefektivKlase", "EnergoefektivKlase_georiga_pref") and val in EPC_PALETTE:
+        if col in ("EnergoefektivKlase", "EnergoefektivKlase_georiga_pref",
+                   "epc_class_cert", "epc_class_georiga", "combined_epc_class",
+                   "predicted_epc_class") and val in EPC_PALETTE:
             val_el = html.Span(
                 val,
                 style={
@@ -1981,18 +3398,155 @@ def _show_detail(selected: list[dict] | None) -> tuple[bool, html.Div]:
     )
 
 
+# Hide language toggle buttons when detail panel is open (they overlap X button)
+@callback(
+    Output("lang-toggle-container", "style"),
+    Input("detail-panel", "is_open"),
+)
+def _toggle_lang_buttons(panel_open: bool) -> dict:
+    base = {"position": "fixed", "top": "10px", "right": "20px", "zIndex": "9999"}
+    if panel_open:
+        return {**base, "display": "none"}
+    return base
+
+
 # ---------------------------------------------------------------------------
 # CSV export
 # ---------------------------------------------------------------------------
 
+# Open download modal
 @callback(
-    Output("explorer-grid", "csvExportParams"),
-    Output("explorer-grid", "exportDataAsCsv"),
-    Input("export-csv-btn", "n_clicks"),
+    Output("download-modal", "is_open"),
+    Input("download-data-btn", "n_clicks"),
     prevent_initial_call=True,
 )
-def _export_csv(_n: int) -> tuple[dict, bool]:
-    return {"columnSeparator": ";"}, True
+def _open_download_modal(_n: int) -> bool:
+    return True
+
+
+# Show/hide CSV separator option
+@callback(
+    Output("download-sep-container", "style"),
+    Input("download-format", "value"),
+)
+def _toggle_csv_sep(fmt: str) -> dict:
+    return {} if fmt == "csv" else {"display": "none"}
+
+
+# Show/hide custom column picker
+@callback(
+    Output("download-col-picker-collapse", "is_open"),
+    Output("download-custom-cols", "options"),
+    Output("download-custom-cols", "value"),
+    Input("download-cols-mode", "value"),
+    State({"type": "col-display", "block": ALL}, "value"),
+    State("lang-store", "data"),
+)
+def _toggle_download_col_picker(mode: str, block_values: list[list[str]], lang: str | None) -> tuple[bool, list, list]:
+    from dash import no_update
+    if mode != "custom":
+        return False, no_update, no_update
+    lang = lang or "lv"
+    visible = [c for block in block_values for c in block]
+    con = _get_duckdb_con()
+    all_cols = [r[0] for r in con.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='buildings'"
+    ).fetchall()]
+    options = [{"label": get_display_name(c, lang), "value": c} for c in all_cols]
+    return True, options, visible
+
+
+# Execute download
+@callback(
+    Output("download-data-sink", "data"),
+    Output("download-modal", "is_open", allow_duplicate=True),
+    Output("download-loading-indicator", "children"),
+    Input("download-execute-btn", "n_clicks"),
+    State("download-format", "value"),
+    State("download-separator", "value"),
+    State("download-rows", "value"),
+    State("download-cols-mode", "value"),
+    State({"type": "col-display", "block": ALL}, "value"),
+    State("download-custom-cols", "value"),
+    State("search-terms-store", "data"),
+    State("search-mode", "data"),
+    State("epc-slicer-store", "data"),
+    State("era-slicer-store", "data"),
+    State("floor-slicer-store", "data"),
+    State("wall-slicer-store", "data"),
+    State("type-slicer-store", "data"),
+    State("map-selected-territory", "data"),
+    State("custom-sample-store", "data"),
+    State("lang-store", "data"),
+    prevent_initial_call=True,
+)
+def _execute_download(
+    _n: int, fmt: str, separator: str, row_scope: str, col_mode: str,
+    block_values: list[list[str]], custom_cols: list[str] | None,
+    terms: list[str], mode: str, epc_classes: list[str],
+    eras: list[str], floors: list[str], walls: list[str], btypes: list[str],
+    map_territory: str | None,
+    custom_sample: list[str], lang: str | None,
+) -> tuple:
+    import io
+    from dash import no_update
+    lang = lang or "lv"
+
+    # Determine columns
+    if col_mode == "all":
+        con = _get_duckdb_con()
+        cols = [r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='buildings'"
+        ).fetchall()]
+    elif col_mode == "custom" and custom_cols:
+        cols = custom_cols
+    else:  # visible
+        cols = [c for block in block_values for c in block]
+
+    if not cols:
+        return no_update, no_update
+
+    # Determine rows
+    if row_scope == "all":
+        rows, _ = _search_filter_duckdb(
+            [], "any", list(EPC_CLASSES_DISPLAY) + ["N/A"],
+            list(ERA_BINS) + ["N/A"], list(WALL_MATERIALS) + ["N/A"],
+            cols, None, cols, page_offset=0, page_size=999999999,
+            floors=list(FLOOR_GROUPS) + ["N/A"],
+            btypes=list(BUILDING_TYPES),
+        )
+    else:
+        rows, _ = _search_filter_duckdb(
+            terms, mode, epc_classes, eras, walls,
+            cols, map_territory, cols, page_offset=0, page_size=999999999,
+            custom_sample=custom_sample or [],
+            floors=floors or [],
+            btypes=btypes or [],
+        )
+
+    if not rows:
+        return no_update, no_update, ""
+
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    # Keep only requested columns (in order)
+    available = [c for c in cols if c in df.columns]
+    df = df[available]
+
+    # Force cadastre numbers to be treated as text in Excel (prevent scientific notation)
+    if "KadastraApzimBuilding" in df.columns:
+        if fmt == "csv":
+            df["KadastraApzimBuilding"] = '="' + df["KadastraApzimBuilding"].astype(str) + '"'
+
+    if fmt == "xlsx":
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False, engine="openpyxl")
+        buf.seek(0)
+        return dcc.send_bytes(buf.getvalue(), "epc_data.xlsx"), False, ""
+    else:
+        # UTF-8 BOM for Excel compatibility with Latvian characters
+        csv_bytes = df.to_csv(index=False, sep=separator).encode("utf-8-sig")
+        return dcc.send_bytes(csv_bytes, "epc_data.csv"), False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -2041,9 +3595,10 @@ def _commit_loaded_columns(_n: int, load_blocks: list[list[str]],
 
 
 @callback(
-    Output("display-cols-container", "children"),
+    Output("display-cols-container", "children", allow_duplicate=True),
     Input("loaded-columns-store", "data"),
     State("lang-store", "data"),
+    prevent_initial_call=True,
 )
 def _rebuild_display_panel(loaded_cols: list[str], lang: str | None) -> html.Div:
     """Rebuild the Display Columns checklist — show columns available in DuckDB."""
@@ -2059,13 +3614,20 @@ def _rebuild_display_panel(loaded_cols: list[str], lang: str | None) -> html.Div
 
 
 # ---------------------------------------------------------------------------
-# Map Filters — Latvia region choropleth
+# Map Filters — Latvia / Riga / Daugavpils choropleth
 # ---------------------------------------------------------------------------
 from pathlib import Path as _Path
 import numpy as _np
 
-_GEOJSON_PATH = _Path(__file__).resolve().parents[2] / "data" / "raw" / "geo" / "Latvia" / "admin_territories" / "latvia_territories_4326.geojson"
+_GEO_ROOT = _Path(__file__).resolve().parents[2] / "data" / "raw" / "geo"
+_GEOJSON_PATH = _GEO_ROOT / "Latvia" / "admin_territories" / "latvia_territories_4326.geojson"
+_RIGA_GEOJSON_PATH = _GEO_ROOT / "Riga" / "apkaimes_4326.geojson"
+_DGP_GEOJSON_PATH = _GEO_ROOT / "Daugavpils" / "apkaimes_daugavpils_4326.geojson"
+
 _LATVIA_GEOJSON: dict | None = None
+_RIGA_GEOJSON: dict | None = None
+_DGP_GEOJSON: dict | None = None
+_DGP_BUILDING_NEIGHBOURHOOD: dict[str, str] | None = None  # cadastre → neighbourhood
 
 
 def _load_geojson() -> dict:
@@ -2076,6 +3638,59 @@ def _load_geojson() -> dict:
     return _LATVIA_GEOJSON
 
 
+def _load_riga_geojson() -> dict:
+    global _RIGA_GEOJSON
+    if _RIGA_GEOJSON is None:
+        with open(_RIGA_GEOJSON_PATH, encoding="utf-8") as f:
+            _RIGA_GEOJSON = json.load(f)
+    return _RIGA_GEOJSON
+
+
+def _load_dgp_geojson() -> dict:
+    global _DGP_GEOJSON
+    if _DGP_GEOJSON is None:
+        with open(_DGP_GEOJSON_PATH, encoding="utf-8") as f:
+            _DGP_GEOJSON = json.load(f)
+    return _DGP_GEOJSON
+
+
+def _load_dgp_building_neighbourhood() -> dict[str, str]:
+    """One-time spatial join: assign Daugavpils buildings to neighbourhoods via KOORD_X/Y."""
+    global _DGP_BUILDING_NEIGHBOURHOOD
+    if _DGP_BUILDING_NEIGHBOURHOOD is not None:
+        return _DGP_BUILDING_NEIGHBOURHOOD
+    import geopandas as _gpd
+    from shapely.geometry import Point as _Point
+
+    # Load neighbourhood polygons in EPSG:3059
+    polys = _gpd.read_file(str(_GEO_ROOT / "Daugavpils" / "apkaimes_daugavpils.gpkg"))
+    polys = polys.rename(columns={"neighborhood": "NOSAUKUMS"})
+    polys = polys.to_crs(epsg=3059) if polys.crs != "EPSG:3059" else polys
+
+    # Load Daugavpils building coords from DuckDB
+    con = _get_duckdb_con()
+    rows = con.execute(
+        "SELECT KadastraApzimBuilding, KOORD_X, KOORD_Y FROM buildings "
+        "WHERE gis_territory_name = 'Daugavpils pilsēta' AND KOORD_X IS NOT NULL AND KOORD_Y IS NOT NULL"
+    ).fetchall()
+    if not rows:
+        _DGP_BUILDING_NEIGHBOURHOOD = {}
+        return _DGP_BUILDING_NEIGHBOURHOOD
+
+    pts = _gpd.GeoDataFrame(
+        {"cadastre": [r[0] for r in rows]},
+        geometry=[_Point(r[1], r[2]) for r in rows],
+        crs="EPSG:3059",
+    )
+    joined = _gpd.sjoin(pts, polys[["NOSAUKUMS", "geometry"]], how="left", predicate="within")
+    result = {}
+    for _, row in joined.iterrows():
+        if row.get("NOSAUKUMS") and not (isinstance(row["NOSAUKUMS"], float) and _np.isnan(row["NOSAUKUMS"])):
+            result[str(row["cadastre"])] = row["NOSAUKUMS"]
+    _DGP_BUILDING_NEIGHBOURHOOD = result
+    return _DGP_BUILDING_NEIGHBOURHOOD
+
+
 # Background color from theme
 _BG_COLOR = BOL_PALETTE.get("bg", "#F5F5F5")
 
@@ -2084,10 +3699,34 @@ _BG_COLOR = BOL_PALETTE.get("bg", "#F5F5F5")
     Output("map-choropleth", "figure"),
     Input("explorer-grid", "virtualRowData"),
     Input("map-selected-territory", "data"),
-    State("lang-store", "data"),
+    Input("lang-store", "data"),
+    Input("map-mode-store", "data"),
+    Input("map-size-store", "data"),
 )
-def _update_map(virtual_data: list[dict] | None, selected: str | None, lang: str | None) -> go.Figure:
+def _update_map(virtual_data: list[dict] | None, selected: str | None, lang: str | None, map_mode: str | None, map_size: str | None) -> go.Figure:
     lang = lang or "lv"
+    _height = 560 if map_size == "large" else 280
+    map_mode = map_mode or "latvia"
+
+    if map_mode == "riga":
+        sel = selected[9:] if selected and selected.startswith("__RIGA__:") else None
+        return _render_city_map(_load_riga_geojson(), sel, lang,
+                                territory_filter="Rīgas pilsēta",
+                                use_apkaime_col=True,
+                                lon_range=[23.9, 24.35], lat_range=[56.85, 57.09],
+                                zmin=70, zmax=108, height=_height)
+    elif map_mode == "daugavpils":
+        sel = selected[8:] if selected and selected.startswith("__DGP__:") else None
+        return _render_city_map(_load_dgp_geojson(), sel, lang,
+                                territory_filter="Daugavpils pilsēta",
+                                use_apkaime_col=True,
+                                lon_range=[26.38, 26.68], lat_range=[55.81, 55.95],
+                                zmin=None, zmax=None, height=_height)
+    else:
+        return _render_latvia_map(selected, lang, height=_height)
+
+
+def _render_latvia_map(selected: str | None, lang: str, height: int = 280) -> go.Figure:
     geojson = _load_geojson()
     names = [f["properties"]["NOSAUKUMS"] for f in geojson["features"]]
 
@@ -2127,9 +3766,9 @@ def _update_map(virtual_data: list[dict] | None, selected: str | None, lang: str
         z=[v if v is not None else 0 for v in z_vals],
         text=hover_texts,
         hoverinfo="text",
-        colorscale="YlOrRd",
-        zmin=50,
-        zmax=200,
+        colorscale="RdYlGn_r",
+        zmin=68,
+        zmax=94,
         marker_line_width=line_widths,
         marker_line_color=line_colors,
         showscale=False,
@@ -2163,7 +3802,119 @@ def _update_map(virtual_data: list[dict] | None, selected: str | None, lang: str
         margin=dict(t=0, b=0, l=0, r=0),
         paper_bgcolor=_BG_COLOR,
         plot_bgcolor=_BG_COLOR,
-        height=280,
+        height=height,
+        dragmode=False,
+        uirevision="map-stable",
+    )
+    return fig
+
+
+def _render_city_map(
+    geojson: dict, selected: str | None, lang: str,
+    territory_filter: str, use_apkaime_col: bool,
+    lon_range: list[float], lat_range: list[float],
+    zmin: float | None, zmax: float | None,
+    height: int = 280,
+) -> go.Figure:
+    """Render a neighbourhood-level choropleth for a city."""
+    names = [f["properties"]["NOSAUKUMS"] for f in geojson["features"]]
+    con = _get_duckdb_con()
+
+    if use_apkaime_col:
+        # Riga: apkaime_name column exists
+        rows = con.execute(
+            "SELECT apkaime_name, AVG(combined_heating_kwh), COUNT(*) "
+            "FROM buildings WHERE gis_territory_name = ? AND apkaime_name IS NOT NULL "
+            "AND combined_heating_kwh IS NOT NULL GROUP BY apkaime_name",
+            [territory_filter],
+        ).fetchall()
+    else:
+        # Daugavpils: use spatial join lookup
+        dgp_map = _load_dgp_building_neighbourhood()
+        if dgp_map:
+            cadastres = list(dgp_map.keys())
+            placeholders = ", ".join(["?"] * len(cadastres))
+            all_rows = con.execute(
+                f"SELECT KadastraApzimBuilding, combined_heating_kwh FROM buildings "
+                f"WHERE KadastraApzimBuilding IN ({placeholders}) AND combined_heating_kwh IS NOT NULL",
+                cadastres,
+            ).fetchall()
+            # Aggregate by neighbourhood
+            from collections import defaultdict
+            agg: dict[str, list[float]] = defaultdict(list)
+            for cad, kwh in all_rows:
+                nb = dgp_map.get(str(cad))
+                if nb:
+                    agg[nb].append(float(kwh))
+            rows = [(nb, sum(vals) / len(vals), len(vals)) for nb, vals in agg.items()]
+        else:
+            rows = []
+
+    avg_map = {r[0]: float(r[1]) for r in rows}
+    count_map = {r[0]: int(r[2]) for r in rows}
+
+    z_vals = []
+    hover_texts = []
+    for name in names:
+        avg = avg_map.get(name)
+        n = count_map.get(name, 0)
+        if avg is not None:
+            avg_label = "Vid." if lang == "lv" else "Avg"
+            hover_texts.append(f"<b>{name}</b><br>{avg_label}: {avg:.1f} kWh/m²/yr<br>n={n}")
+        else:
+            no_data = "Nav EPC datu" if lang == "lv" else "No EPC data"
+            hover_texts.append(f"<b>{name}</b><br>{no_data}")
+        z_vals.append(avg)
+
+    # Auto-calibrate if zmin/zmax not provided
+    valid_z = [v for v in z_vals if v is not None]
+    if zmin is None and valid_z:
+        zmin = min(valid_z) - 2
+    if zmax is None and valid_z:
+        zmax = max(valid_z) + 2
+
+    fig = go.Figure(go.Choropleth(
+        geojson=geojson,
+        locations=names,
+        featureidkey="properties.NOSAUKUMS",
+        z=[v if v is not None else 0 for v in z_vals],
+        text=hover_texts,
+        hoverinfo="text",
+        colorscale="RdYlGn_r",
+        zmin=zmin or 0,
+        zmax=zmax or 200,
+        marker_line_width=0.5,
+        marker_line_color=BOL_PALETTE["navy"],
+        showscale=False,
+    ))
+
+    if selected and selected in names:
+        sel_idx = names.index(selected)
+        fig.add_trace(go.Choropleth(
+            geojson=geojson,
+            locations=[selected],
+            featureidkey="properties.NOSAUKUMS",
+            z=[1],
+            colorscale=[[0, BOL_PALETTE["teal"]], [1, BOL_PALETTE["teal"]]],
+            showscale=False,
+            hoverinfo="text",
+            text=[hover_texts[sel_idx]],
+            marker_line_width=1,
+            marker_line_color=BOL_PALETTE["navy"],
+        ))
+
+    fig.update_geos(
+        visible=False,
+        bgcolor=_BG_COLOR,
+        projection_type="mercator",
+        lonaxis_range=lon_range,
+        lataxis_range=lat_range,
+    )
+    fig.update_layout(
+        margin=dict(t=0, b=0, l=0, r=0),
+        paper_bgcolor=_BG_COLOR,
+        plot_bgcolor=_BG_COLOR,
+        height=height,
         dragmode=False,
         uirevision="map-stable",
     )
@@ -2171,13 +3922,51 @@ def _update_map(virtual_data: list[dict] | None, selected: str | None, lang: str
 
 
 @callback(
+    Output("map-mode-store", "data"),
+    Output("map-selected-territory", "data", allow_duplicate=True),
+    Output("map-mode-latvia", "active"),
+    Output("map-mode-riga", "active"),
+    Output("map-mode-daugavpils", "active"),
+    Input("map-mode-latvia", "n_clicks"),
+    Input("map-mode-riga", "n_clicks"),
+    Input("map-mode-daugavpils", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _set_map_mode(_lv: int | None, _riga: int | None, _dgp: int | None) -> tuple[str, None, bool, bool, bool]:
+    trigger = ctx.triggered_id
+    if trigger == "map-mode-riga":
+        return "riga", None, False, True, False
+    elif trigger == "map-mode-daugavpils":
+        return "daugavpils", None, False, False, True
+    return "latvia", None, True, False, False
+
+
+@callback(
+    Output("map-size-store", "data"),
+    Output("map-size-normal", "active"),
+    Output("map-size-large", "active"),
+    Output("map-choropleth", "style"),
+    Input("map-size-normal", "n_clicks"),
+    Input("map-size-large", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _set_map_size(_normal: int | None, _large: int | None) -> tuple[str, bool, bool, dict]:
+    trigger = ctx.triggered_id
+    base = {"marginTop": "0", "marginBottom": "0", "paddingBottom": "0"}
+    if trigger == "map-size-large":
+        return "large", False, True, {**base, "width": "960px"}
+    return "normal", True, False, {**base, "width": "480px"}
+
+
+@callback(
     Output("map-selected-territory", "data"),
     Input("map-choropleth", "clickData"),
     Input("map-clear-btn", "n_clicks"),
     Input("map-na-btn", "n_clicks"),
+    State("map-mode-store", "data"),
     prevent_initial_call=True,
 )
-def _handle_map_click(click_data: dict | None, _clear: int | None, _na: int | None) -> str | None:
+def _handle_map_click(click_data: dict | None, _clear: int | None, _na: int | None, map_mode: str | None) -> str | None:
     trigger = ctx.triggered_id
     if trigger == "map-clear-btn":
         return None
@@ -2186,7 +3975,13 @@ def _handle_map_click(click_data: dict | None, _clear: int | None, _na: int | No
     if click_data and "points" in click_data:
         pts = click_data["points"]
         if pts and "location" in pts[0]:
-            return pts[0]["location"]
+            loc = pts[0]["location"]
+            # Encode map mode in the selection value
+            if map_mode == "riga":
+                return f"__RIGA__:{loc}"
+            elif map_mode == "daugavpils":
+                return f"__DGP__:{loc}"
+            return loc
     return no_update
 
 
@@ -2202,6 +3997,9 @@ def _style_map_na_btn(selected: str | None) -> dict:
     if selected == "__NA__":
         base.update({"backgroundColor": BOL_PALETTE["teal"], "color": "#FFFFFF",
                       "borderColor": BOL_PALETTE["teal"]})
+    else:
+        base.update({"backgroundColor": "transparent", "color": BOL_PALETTE["teal"],
+                      "border": f"1px solid {BOL_PALETTE['teal']}"})
     return base
 
 
@@ -2219,8 +4017,10 @@ def _style_map_na_btn(selected: str | None) -> dict:
     Output("custom-filter-toggle", "children", allow_duplicate=True),
     Output("filter-breakdown-toggle", "children", allow_duplicate=True),
     Output("plots-toggle", "children", allow_duplicate=True),
+    Output("maps-toggle", "children", allow_duplicate=True),
+    Output("custom-sample-toggle", "children", allow_duplicate=True),
     Output("search-input", "placeholder"),
-    Output("export-csv-btn", "children"),
+    Output("download-data-btn", "children"),
     Output("page-prev-btn", "children"),
     Output("page-next-btn", "children"),
     Output("map-na-btn", "children"),
@@ -2228,17 +4028,73 @@ def _style_map_na_btn(selected: str | None) -> dict:
     Output("detail-panel", "title"),
     Output("panel-loading-msg", "children"),
     Output("explorer-grid", "columnDefs"),
+    # Tooltips
+    Output("search-tooltip", "children"),
+    Output("search-mode-tooltip", "children"),
+    Output("slicer-mode-tooltip", "children"),
+    Output("chart-ref-tooltip", "children"),
+    Output("epc-chart-tooltip", "children"),
+    Output("era-chart-tooltip", "children"),
+    Output("wall-chart-tooltip", "children"),
+    Output("energy-chart-tooltip", "children"),
+    # Labels
+    Output("search-match-label", "children"),
+    Output("col-select-help", "children"),
+    Output("slicer-mode-label-text", "children"),
+    Output("epc-slicer-label", "children"),
+    Output("era-slicer-label", "children"),
+    Output("floor-slicer-label", "children"),
+    Output("wall-slicer-label", "children"),
+    Output("epc-slicer-all", "children"),
+    Output("era-slicer-all", "children"),
+    Output("floor-slicer-all", "children"),
+    Output("wall-slicer-all", "children"),
+    # Wall material button labels
+    Output({"type": "wall-slicer", "index": "Wood"}, "children"),
+    Output({"type": "wall-slicer", "index": "Brick and stone"}, "children"),
+    Output({"type": "wall-slicer", "index": "Concrete"}, "children"),
+    Output({"type": "wall-slicer", "index": "Lightweight concrete"}, "children"),
+    Output({"type": "wall-slicer", "index": "Metal and glass"}, "children"),
+    Output({"type": "wall-slicer", "index": "Other"}, "children"),
+    # Type slicer labels
+    Output("type-slicer-label", "children"),
+    Output("type-slicer-all", "children"),
+    Output({"type": "type-slicer", "index": "Residential_Individual"}, "children"),
+    Output({"type": "type-slicer", "index": "Residential_Apartment"}, "children"),
+    # Plot checklist + ref toggle
+    Output("plot-checklist", "options"),
+    Output("chart-ref-toggle", "label"),
+    # Column picker rebuild
+    Output("display-cols-container", "children"),
+    # Custom sample panel text
+    Output("custom-sample-help", "children"),
+    Output("custom-sample-format-link", "children"),
+    Output("custom-sample-input", "placeholder"),
+    Output("custom-sample-load-btn", "children"),
+    Output("custom-sample-add-btn", "children"),
+    Output("custom-sample-clear-btn", "children"),
+    Output("custom-sample-format-text", "children"),
+    # Download modal
+    Output("download-modal-title", "children"),
+    Output("download-format-label", "children"),
+    Output("download-sep-label", "children"),
+    Output("download-rows-label", "children"),
+    Output("download-cols-label", "children"),
+    Output("download-execute-btn", "children"),
     Input("lang-store", "data"),
     State("col-selector-collapse", "is_open"),
     State("custom-filter-collapse", "is_open"),
     State("filter-breakdown-collapse", "is_open"),
     State("plots-collapse", "is_open"),
+    State("maps-collapse", "is_open"),
+    State("custom-sample-collapse", "is_open"),
     State({"type": "col-display", "block": ALL}, "value"),
     prevent_initial_call=True,
 )
 def _update_language(
     lang: str | None,
     cols_open: bool, filters_open: bool, breakdown_open: bool, plots_open: bool,
+    maps_open: bool, custom_sample_open: bool,
     block_values: list[list[str]],
 ) -> tuple:
     lang = lang or "lv"
@@ -2246,6 +4102,8 @@ def _update_language(
     arrow_filt = "\u25b2" if filters_open else "\u25bc"
     arrow_bd = "\u25b2" if breakdown_open else "\u25bc"
     arrow_pl = "\u25b2" if plots_open else "\u25bc"
+    arrow_maps = "\u25b2" if maps_open else "\u25bc"
+    arrow_cs = "\u25b2" if custom_sample_open else "\u25bc"
     # Rebuild column defs with new language
     visible = [c for block in block_values for c in block]
     all_cols = list(EPC_TABLE_COLUMNS)
@@ -2258,14 +4116,35 @@ def _update_language(
     except Exception:
         pass
     col_defs = _make_column_defs(visible, all_cols, lang=lang)
+
+    # Plot checklist options
+    plot_opts = [
+        {"label": t("plot.checklist.epc", lang), "value": "epc_dist"},
+        {"label": t("plot.checklist.era", lang), "value": "era_dist"},
+        {"label": t("plot.checklist.wall", lang), "value": "wall_dist"},
+        {"label": t("plot.checklist.avg_energy", lang), "value": "avg_energy"},
+        {"label": t("plot.checklist.floor", lang), "value": "floor_dist"},
+        {"label": t("plot.checklist.primary_energy", lang), "value": "primary_energy_dist"},
+    ]
+
+    # Rebuild column picker with new language
+    col_picker = _build_column_picker(set(all_cols), picker_type="display", lang=lang, selected=set(visible))
+
+    # Wall material button labels
+    wall_labels = [WALL_MATERIAL_DISPLAY[m].get(lang, m) for m in WALL_MATERIALS]
+
+    slicer_all = t("slicer.all", lang)
+
     return (
         t("nav.explorer", lang),
         f"{t('btn.columns', lang)} {arrow_cols}",
         f"{t('btn.custom_filters', lang)} {arrow_filt}",
         f"{t('btn.filter_breakdown', lang)} {arrow_bd}",
         f"{t('btn.plots', lang)} {arrow_pl}",
+        f"{t('btn.maps', lang)} {arrow_maps}",
+        f"{t('btn.custom_sample', lang)} {arrow_cs}",
         t("search.placeholder", lang),
-        t("btn.export_csv", lang),
+        t("btn.download_data", lang),
         t("btn.prev_page", lang),
         t("btn.next_page", lang),
         t("btn.no_region", lang),
@@ -2273,4 +4152,52 @@ def _update_language(
         t("detail.building_details", lang),
         t("panel.loading", lang),
         col_defs,
+        # Tooltips
+        t("tooltip.search", lang),
+        t("tooltip.search_mode", lang),
+        t("tooltip.slicer_mode", lang),
+        t("tooltip.ref_line", lang),
+        t("tooltip.epc_chart", lang),
+        t("tooltip.era_chart", lang),
+        t("tooltip.wall_chart", lang),
+        t("tooltip.energy_chart", lang),
+        # Labels
+        t("search.match_label", lang),
+        t("cols.select_help", lang),
+        t("slicer.mode_label", lang),
+        t("slicer.epc_label", lang),
+        t("slicer.era_label", lang),
+        t("slicer.floor_label", lang),
+        t("slicer.wall_label", lang),
+        slicer_all,
+        slicer_all,
+        slicer_all,
+        slicer_all,
+        # Wall material buttons
+        *wall_labels,
+        # Type slicer labels
+        t("slicer.type_label", lang),
+        slicer_all,
+        BUILDING_TYPE_DISPLAY["Residential_Individual"].get(lang, "Individual"),
+        BUILDING_TYPE_DISPLAY["Residential_Apartment"].get(lang, "Apartment"),
+        # Plot checklist + ref toggle
+        plot_opts,
+        t("plot.ref_label", lang),
+        # Column picker
+        col_picker,
+        # Custom sample panel
+        t("custom.help", lang),
+        t("custom.format_help_link", lang),
+        t("custom.placeholder", lang),
+        t("custom.load_btn", lang),
+        t("custom.add_btn", lang),
+        t("custom.clear_btn", lang),
+        t("custom.format_help", lang),
+        # Download modal
+        t("download.title", lang),
+        t("download.format", lang),
+        t("download.separator", lang),
+        t("download.rows", lang),
+        t("download.cols", lang),
+        t("download.btn", lang),
     )
